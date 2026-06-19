@@ -7,8 +7,8 @@ import { OpenAICompatInferenceClient } from './openAICompatInferenceClient.js'
 import { enableConfigs } from '../../utils/config.js'
 import { getClaudeAIOAuthTokens } from '../../utils/auth.js'
 import {
-  KIMI_K2_6_BASE_URL,
-  KIMI_K2_6_MODEL,
+  KIMI_2_7_CODER_BASE_URL,
+  KIMI_2_7_CODER_MODEL,
 } from '../../utils/model/ncodeModels.js'
 
 type FetchOverride = NonNullable<
@@ -220,14 +220,14 @@ describe('getInferenceClient', () => {
     expect(request.headers.get('x-claude-code-session-id')).toBeTruthy()
   })
 
-  it('routes managed K2.6 to the Prime serving edge', async () => {
+  it('routes managed Kimi 2.7 Coder to the configured serving edge', async () => {
     process.env.NOUMENA_BASE_URL = 'https://wrong-default.example.test'
     const recorder = createModelsFetchRecorder()
 
     const client = await getInferenceClient({
       maxRetries: 3,
-      source: 'k2.6',
-      model: KIMI_K2_6_MODEL,
+      source: 'k2.7',
+      model: KIMI_2_7_CODER_MODEL,
       fetchOverride: recorder.fetchOverride,
     })
 
@@ -235,7 +235,9 @@ describe('getInferenceClient', () => {
     expect(await collectModels(client as OpenAICompatInferenceClient)).toEqual([
       { id: 'test-model' },
     ])
-    expect(recorder.getRequest().url).toBe(`${KIMI_K2_6_BASE_URL}/v1/models`)
+    expect(recorder.getRequest().url).toBe(
+      `${KIMI_2_7_CODER_BASE_URL}/v1/models`,
+    )
   })
 
   it('supports non-first-party ANTHROPIC_BASE_URL as a legacy compatibility alias', async () => {
@@ -318,7 +320,7 @@ describe('getInferenceClient', () => {
   })
 
   it('forwards managed OAuth bearer auth to the Noumena inference edge', async () => {
-    process.env.NOUMENA_BASE_URL = 'https://code.dev.noumena.test'
+    process.env.NOUMENA_BASE_URL = 'https://code.staging.noumena.com'
     delete process.env.ANTHROPIC_AUTH_TOKEN
     delete process.env.ANTHROPIC_API_KEY
     process.env.CLAUDE_CODE_OAUTH_TOKEN = 'managed-oauth-token'
@@ -337,7 +339,7 @@ describe('getInferenceClient', () => {
     ])
 
     const request = recorder.getRequest()
-    expect(request.url).toBe('https://code.dev.noumena.test/v1/models')
+    expect(request.url).toBe('https://code.staging.noumena.com/v1/models')
     expect(request.headers.get('authorization')).toBe(
       'Bearer managed-oauth-token',
     )
@@ -346,7 +348,7 @@ describe('getInferenceClient', () => {
   })
 
   it('does not force a compat API-key header onto managed bearer sessions', async () => {
-    process.env.NOUMENA_BASE_URL = 'https://code.dev.noumena.test'
+    process.env.NOUMENA_BASE_URL = 'https://code.staging.noumena.com'
     delete process.env.ANTHROPIC_AUTH_TOKEN
     process.env.ANTHROPIC_API_KEY = 'byok-static-env-key'
     process.env.CLAUDE_CODE_OAUTH_TOKEN = 'managed-oauth-token'
@@ -365,7 +367,7 @@ describe('getInferenceClient', () => {
     ])
 
     const request = recorder.getRequest()
-    expect(request.url).toBe('https://code.dev.noumena.test/v1/models')
+    expect(request.url).toBe('https://code.staging.noumena.com/v1/models')
     expect(request.headers.get('authorization')).toBe(
       'Bearer managed-oauth-token',
     )
@@ -373,7 +375,7 @@ describe('getInferenceClient', () => {
   })
 
   it('keeps static BYOK env-key inference working on the Noumena OpenAI-compatible edge', async () => {
-    process.env.NOUMENA_BASE_URL = 'https://code.dev.noumena.test'
+    process.env.NOUMENA_BASE_URL = 'https://code.staging.noumena.com'
     delete process.env.ANTHROPIC_AUTH_TOKEN
     delete process.env.CLAUDE_CODE_OAUTH_TOKEN
     process.env.NODE_ENV = 'test'
@@ -394,7 +396,7 @@ describe('getInferenceClient', () => {
     ])
 
     const request = recorder.getRequest()
-    expect(request.url).toBe('https://code.dev.noumena.test/v1/models')
+    expect(request.url).toBe('https://code.staging.noumena.com/v1/models')
     expect(request.headers.get('authorization')).toBeNull()
     expect(request.headers.get('x-api-key')).toBe('byok-static-env-key')
   })
