@@ -69,40 +69,13 @@ function getLegacyOpenAICompatBaseUrl(): string | undefined {
   if (!legacyBaseUrl) {
     return undefined
   }
-  if (
-    isFirstPartyNoumenaBaseUrl() ||
-    isAnthropicMessagesBaseUrl(legacyBaseUrl)
-  ) {
-    return undefined
-  }
-  return legacyBaseUrl
-}
-
-function getAnthropicMessagesBaseUrl(): string | undefined {
-  const baseUrl = process.env.ANTHROPIC_BASE_URL?.trim()
-  return baseUrl && isAnthropicMessagesBaseUrl(baseUrl) ? baseUrl : undefined
-}
-
-function isAnthropicMessagesBaseUrl(baseUrl: string): boolean {
-  try {
-    const url = new URL(baseUrl)
-    const path = url.pathname.replace(/\/+$/, '')
-    return (
-      url.hostname.toLowerCase() === 'api.z.ai' && path === '/api/anthropic'
-    )
-  } catch {
-    return false
-  }
+  return isFirstPartyNoumenaBaseUrl() ? undefined : legacyBaseUrl
 }
 
 export async function getInferenceClient(
   args: Parameters<typeof getAnthropicClient>[0],
 ): Promise<InferenceClient> {
   if (getAPIProvider() === 'firstParty') {
-    if (getAnthropicMessagesBaseUrl()) {
-      return new AnthropicInferenceClient(await getAnthropicClient(args))
-    }
-
     const managedModelBaseURL = getNCodeManagedModelBaseUrl(args.model)
     const configuredCompatBaseURL =
       getNoumenaBaseUrl() ?? getLegacyOpenAICompatBaseUrl()

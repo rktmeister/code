@@ -32,7 +32,6 @@ const envKeys = [
   'USER_TYPE',
   'NCODE_AGENT_SDK_CLIENT_APP',
   'CLAUDE_CODE_ORGANIZATION_UUID',
-  'NCODE_REMOTE_RUNTIME_PROVIDER_MODE',
 ] as const
 
 const originalEnv = Object.fromEntries(
@@ -60,7 +59,6 @@ function setStableTestRuntime() {
   delete process.env.CLAUDE_CODE_USE_VERTEX
   delete process.env.CLAUDE_CODE_USE_FOUNDRY
   delete process.env.NOUMENA_API_KEY
-  delete process.env.NCODE_REMOTE_RUNTIME_PROVIDER_MODE
   delete process.env.CI
 
   process.env.ANTHROPIC_API_KEY = 'anthropic-direct-test-key'
@@ -97,51 +95,6 @@ function createModelsFetchRecorder() {
       status: 200,
       headers: { 'content-type': 'application/json' },
     })
-  }
-
-  return {
-    fetchOverride,
-    getRequest() {
-      expect(request).toBeDefined()
-      return request as NonNullable<typeof request>
-    },
-  }
-}
-
-function createAnthropicMessageFetchRecorder() {
-  let request:
-    | {
-        url: string
-        method: string | undefined
-        headers: Headers
-      }
-    | undefined
-
-  const fetchOverride: FetchOverride = async (input, init) => {
-    request = {
-      url: input instanceof Request ? input.url : String(input),
-      method: init?.method,
-      headers: new Headers(init?.headers),
-    }
-    return new Response(
-      JSON.stringify({
-        id: 'msg_test',
-        type: 'message',
-        role: 'assistant',
-        model: 'glm-5.2',
-        content: [{ type: 'text', text: 'ok' }],
-        stop_reason: 'end_turn',
-        stop_sequence: null,
-        usage: {
-          input_tokens: 1,
-          output_tokens: 1,
-        },
-      }),
-      {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      },
-    )
   }
 
   return {
@@ -262,47 +215,6 @@ describe('getInferenceClient', () => {
     expect(request.headers.get('user-agent')).toContain('ncode/test-version')
   })
 
-  it('routes Z.ai Anthropic Messages endpoint through the Anthropic-backed seam', async () => {
-    process.env.NOUMENA_BASE_URL = 'https://api.noumena.com'
-    process.env.ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic'
-    delete process.env.ANTHROPIC_API_KEY
-    const recorder = createAnthropicMessageFetchRecorder()
-
-    const client = await getInferenceClient({
-      maxRetries: 0,
-      source: 'zai-anthropic',
-      fetchOverride: recorder.fetchOverride,
-    })
-
-    expect(client).not.toBeInstanceOf(OpenAICompatInferenceClient)
-
-    await client.createMessage({
-      model: 'glm-5.2[1m]',
-      max_tokens: 1,
-      messages: [{ role: 'user', content: 'Hi' }],
-    })
-
-    const request = recorder.getRequest()
-    expect(request.url).toBe(
-      'https://api.z.ai/api/anthropic/v1/messages?beta=true',
-    )
-    expect(request.method).toBe('POST')
-    expect(request.headers.get('authorization')).toBe('Bearer test-auth-token')
-    expect(request.headers.get('x-api-key')).toBeNull()
-  })
-
-  it('recognizes trailing slash on the Z.ai Anthropic Messages endpoint', async () => {
-    process.env.NOUMENA_BASE_URL = 'https://api.noumena.com'
-    process.env.ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic/'
-
-    const client = await getInferenceClient({
-      maxRetries: 1,
-      source: 'zai-anthropic',
-    })
-
-    expect(client).not.toBeInstanceOf(OpenAICompatInferenceClient)
-  })
-
   it('does not reinterpret first-party Anthropic hosts as Noumena OpenAI-compatible endpoints', async () => {
     process.env.ANTHROPIC_BASE_URL = 'https://api.anthropic.com'
 
@@ -378,8 +290,6 @@ describe('getInferenceClient', () => {
     process.env.NOUMENA_BASE_URL = 'https://code.staging.noumena.com'
     delete process.env.ANTHROPIC_AUTH_TOKEN
     delete process.env.CLAUDE_CODE_OAUTH_TOKEN
-    process.env.NODE_ENV = 'test'
-    process.env.NCODE_REMOTE_RUNTIME_PROVIDER_MODE = 'byok'
     process.env.ANTHROPIC_API_KEY = 'byok-static-env-key'
 
     const recorder = createModelsFetchRecorder()
