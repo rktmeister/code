@@ -2,9 +2,13 @@ import { afterEach, describe, expect, it } from 'bun:test'
 import { getAuthRuntime } from '../../auth/runtime/AuthRuntime.js'
 import type { ResolvedAuthSession } from '../../auth/runtime/types.js'
 import {
+  getDefaultFlashModel,
   getDefaultMainLoopModelSetting,
+  getDefaultOpusModel,
   isOpus1mMergeEnabled,
+  parseUserSpecifiedModel,
 } from './model.js'
+import { GLM_5_2_MODEL } from './ncodeModels.js'
 
 const originalEntryPoint = process.env.CLAUDE_CODE_ENTRYPOINT
 const originalUserType = process.env.USER_TYPE
@@ -13,6 +17,8 @@ const originalDisable1m = process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT
 const originalUseBedrock = process.env.CLAUDE_CODE_USE_BEDROCK
 const originalUseVertex = process.env.CLAUDE_CODE_USE_VERTEX
 const originalUseFoundry = process.env.CLAUDE_CODE_USE_FOUNDRY
+const originalOpenAIApiKey = process.env.OPENAI_API_KEY
+const originalOpenAIModel = process.env.OPENAI_MODEL
 const originalDefaultOpus = process.env.NOUMENA_DEFAULT_OPUS_MODEL
 const originalDefaultSonnet = process.env.NOUMENA_DEFAULT_SONNET_MODEL
 const originalDefaultHaiku = process.env.NOUMENA_DEFAULT_HAIKU_MODEL
@@ -67,6 +73,16 @@ function restoreEnv(): void {
     delete process.env.NOUMENA_DEFAULT_HAIKU_MODEL
   } else {
     process.env.NOUMENA_DEFAULT_HAIKU_MODEL = originalDefaultHaiku
+  }
+  if (originalOpenAIApiKey === undefined) {
+    delete process.env.OPENAI_API_KEY
+  } else {
+    process.env.OPENAI_API_KEY = originalOpenAIApiKey
+  }
+  if (originalOpenAIModel === undefined) {
+    delete process.env.OPENAI_MODEL
+  } else {
+    process.env.OPENAI_MODEL = originalOpenAIModel
   }
 }
 
@@ -147,7 +163,7 @@ afterEach(() => {
 })
 
 describe('model auth session gating', () => {
-  it('defaults noumena-managed first-party sessions to kimi-2.7-coder', () => {
+  it('defaults noumena-managed first-party sessions to the GLM 5.2 premium tier', () => {
     process.env.CLAUDE_CODE_ENTRYPOINT = 'cli'
     process.env.USER_TYPE = 'test'
     delete process.env.NCODE_BUILD_MODE
@@ -172,7 +188,7 @@ describe('model auth session gating', () => {
     })
 
     withMockCurrentSession(session, () => {
-      expect(getDefaultMainLoopModelSetting()).toBe('kimi-2.7-coder')
+      expect(getDefaultMainLoopModelSetting()).toBe(GLM_5_2_MODEL)
     })
   })
 
@@ -227,7 +243,78 @@ describe('model auth session gating', () => {
 
     withMockCurrentSession(session, () => {
       expect(isOpus1mMergeEnabled()).toBe(true)
-      expect(getDefaultMainLoopModelSetting()).toBe('kimi-2.7-coder')
+      expect(getDefaultMainLoopModelSetting()).toBe(GLM_5_2_MODEL)
     })
   })
+
+  it('uses OpenAI-compatible defaults for OPENAI_API_KEY sessions', () => {
+    process.env.CLAUDE_CODE_ENTRYPOINT = 'cli'
+    process.env.USER_TYPE = 'test'
+    delete process.env.NCODE_BUILD_MODE
+    delete process.env.CLAUDE_CODE_DISABLE_1M_CONTEXT
+    delete process.env.CLAUDE_CODE_USE_BEDROCK
+    delete process.env.CLAUDE_CODE_USE_VERTEX
+    delete process.env.CLAUDE_CODE_USE_FOUNDRY
+    process.env.OPENAI_API_KEY = 'openai-key'
+    process.env.OPENAI_MODEL = 'custom-openai-model'
+
+    const session = makeSession({
+      principalKind: 'api_key_user',
+      principalSource: 'direct_api_key_env',
+      sessionState: 'usable',
+      headersKind: 'none',
+      providerAuthKind: 'byok_static_env',
+      providerPlan: {
+        mode: 'byok_static_env',
+        source: 'direct_api_key_env',
+        staticKeyEnvVarName: 'OPENAI_API_KEY',
+      },
+      hasUsableApiKey: true,
+      apiKey: 'openai-key',
+      rawApiKeySource: 'OPENAI_API_KEY',
+    })
+
+    withMockCurrentSession(session, () => {
+      expect(getDefaultOpusModel()).toBe('custom-openai-model')
+      expect(getDefaultFlashModel()).toBe('custom-openai-model')
+      expect(getDefaultMainLoopModelSetting()).toBe('custom-openai-model')
+    })
+  })
+
+  it('forwards BYOK OpenAI-compat model ids verbatim, even when they collide with a managed alias', () => {
+    process.env.CLAUDE_CODE_ENTRYPOINT = 'cli'
+    process.env.USER_TYPE = 'test'
+    delete process.env.NCODE_BUILD_MODE
+    delete process.env.CLAUDE_CODE_USE_BEDROCK
+    delete process.env.CLAUDE_CODE_USE_VERTEX
+    delete process.env.CLAUDE_CODE_USE_FOUNDRY
+    process.env.OPENAI_API_KEY = 'openai-key'
+
+    const session = makeSession({
+      principalKind: 'api_key_user',
+      principalSource: 'direct_api_key_env',
+      sessionState: 'usable',
+      headersKind: 'none',
+      providerAuthKind: 'byok_static_env',
+      providerPlan: {
+        mode: 'byok_static_env',
+        source: 'direct_api_key_env',
+        staticKeyEnvVarName: 'OPENAI_API_KEY',
+      },
+      hasUsableApiKey: true,
+      apiKey: 'openai-key',
+      rawApiKeySource: 'OPENAI_API_KEY',
+    })
+
+    withMockCurrentSession(session, () => {
+      // `glm-5.2` / `k2.7` are reserved NCode managed aliases, but here they name
+      // a model on the user's own OpenAI-compatible server. They must reach the
+      // wire verbatim rather than being rewritten to an internal deployment path
+      // (which the user's server would 404).
+      expect(parseUserSpecifiedModel('glm-5.2')).toBe('glm-5.2')
+      expect(parseUserSpecifiedModel('k2.7')).toBe('k2.7')
+      expect(parseUserSpecifiedModel('my-own-model')).toBe('my-own-model')
+    })
+  })
+
 })

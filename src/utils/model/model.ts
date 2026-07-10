@@ -17,7 +17,11 @@ import { formatModelPricing, getOpus46CostTier } from '../modelCost.js'
 import { getCurrentSubscriptionSessionState } from '../subscriptionSession.js'
 import { getSettings_DEPRECATED } from '../settings/settings.js'
 import type { PermissionMode } from '../permissions/PermissionMode.js'
-import { getAPIProvider } from './providers.js'
+import {
+  getAPIProvider,
+  getOpenAICompatDefaultModel,
+  isOpenAICompatByokActive,
+} from './providers.js'
 import {
   getAntModelOverrideConfig,
   resolveAntModel,
@@ -39,7 +43,16 @@ export type ModelName = string
 export type ModelSetting = ModelName | ModelAlias | null
 
 function getConfiguredMainModelEnv(): string | undefined {
-  return process.env.NOUMENA_MODEL || process.env.ANTHROPIC_MODEL
+  if (isOpenAICompatByokActive()) {
+    return (
+      process.env.OPENAI_MODEL ||
+      process.env.NOUMENA_MODEL ||
+      process.env.ANTHROPIC_MODEL
+    )
+  }
+  return (
+    process.env.NOUMENA_MODEL || process.env.ANTHROPIC_MODEL
+  )
 }
 
 function getConfiguredSmallFastModelEnv(): string | undefined {
@@ -146,6 +159,9 @@ export function getBestModel(): ModelName {
 
 // @[MODEL LAUNCH]: Update the default Opus model (3P providers may lag so keep defaults unchanged).
 export function getDefaultOpusModel(): ModelName {
+  if (isOpenAICompatByokActive()) {
+    return getOpenAICompatDefaultModel()
+  }
   const configuredModel = getConfiguredDefaultOpusModelEnv()
   if (configuredModel) {
     return configuredModel
@@ -161,6 +177,9 @@ export function getDefaultOpusModel(): ModelName {
 
 // @[MODEL LAUNCH]: Update the default Flash model (3P providers may lag so keep defaults unchanged).
 export function getDefaultFlashModel(): ModelName {
+  if (isOpenAICompatByokActive()) {
+    return getOpenAICompatDefaultModel()
+  }
   const configuredModel = getConfiguredDefaultFlashModelEnv()
   if (configuredModel) {
     return configuredModel
@@ -177,6 +196,9 @@ export function getDefaultFlashModel(): ModelName {
 
 // @[MODEL LAUNCH]: Update the default Haiku model (3P providers may lag so keep defaults unchanged).
 export function getDefaultHaikuModel(): ModelName {
+  if (isOpenAICompatByokActive()) {
+    return getOpenAICompatDefaultModel()
+  }
   const configuredModel = getConfiguredDefaultHaikuModelEnv()
   if (configuredModel) {
     return configuredModel
@@ -544,9 +566,16 @@ export function parseUserSpecifiedModel(
     ? normalizedModel.replace(/\[1m]$/i, '').trim()
     : normalizedModel
 
-  const exactNcodeModel = resolveNCodeManagedModel(normalizedModel)
-  if (exactNcodeModel) {
-    return exactNcodeModel.model
+  // BYOK OpenAI-compat: the model id names a model on the user's own server and
+  // must pass through verbatim. Never resolve it against the built-in NCODE
+  // managed-model aliases — an id that collides with a reserved alias (e.g.
+  // `glm-5.2`, `k2.7`) would otherwise be rewritten to an internal deployment
+  // path the user's server does not recognize, causing a 404.
+  if (!isOpenAICompatByokActive()) {
+    const exactNcodeModel = resolveNCodeManagedModel(normalizedModel)
+    if (exactNcodeModel) {
+      return exactNcodeModel.model
+    }
   }
 
   if (isModelAlias(modelString)) {
@@ -565,9 +594,13 @@ export function parseUserSpecifiedModel(
     }
   }
 
-  const ncodeModel = resolveNCodeManagedModel(modelString)
-  if (ncodeModel) {
-    return ncodeModel.model
+  // See the BYOK note above: managed-alias resolution is skipped entirely for
+  // BYOK OpenAI-compat sessions so the user's model id is forwarded verbatim.
+  if (!isOpenAICompatByokActive()) {
+    const ncodeModel = resolveNCodeManagedModel(modelString)
+    if (ncodeModel) {
+      return ncodeModel.model
+    }
   }
 
   // Opus 4/4.1 are no longer available on the first-party API (same as

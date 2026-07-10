@@ -52,7 +52,7 @@ type Props = {
   };
 };
 type Step = 'userInput' | 'consent' | 'submitting' | 'done';
-type FeedbackData = {
+export type FeedbackData = {
   // latestAssistantMessageId is the message ID from the latest main model call
   latestAssistantMessageId: string | null;
   message_count: number;
@@ -248,7 +248,7 @@ export function Feedback({
       // Stay on userInput step so user can retry with their content preserved
       setStep('userInput');
     }
-  }, [description, envInfo.isGit, messages]);
+  }, [backgroundTasks, description, envInfo.isGit, messages]);
 
   // Handle cancel - this will be called by Dialog's automatic Esc handling
   const handleCancel = useCallback(() => {
@@ -258,6 +258,7 @@ export function Feedback({
         onDone('Error submitting feedback / bug report', {
           display: 'system'
         });
+
       } else {
         onDone('Feedback / bug report submitted', {
           display: 'system'
@@ -288,6 +289,7 @@ export function Feedback({
         onDone('Error submitting feedback / bug report', {
           display: 'system'
         });
+
       } else {
         onDone('Feedback / bug report submitted', {
           display: 'system'
@@ -516,7 +518,7 @@ function sanitizeAndLogError(err: unknown): void {
     logError(new Error(errorString));
   }
 }
-async function submitFeedback(data: FeedbackData, signal?: AbortSignal): Promise<{
+export async function submitFeedback(data: FeedbackData, signal?: AbortSignal): Promise<{
   success: boolean;
   feedbackId?: string;
   isZdrOrg?: boolean;
@@ -538,7 +540,7 @@ async function submitFeedback(data: FeedbackData, signal?: AbortSignal): Promise
       'User-Agent': getUserAgent(),
       ...authResult.headers
     };
-    const response = await axios.post(buildNoumenaPlatformUrl('/api/claude_cli_feedback'), {
+    const response = await axios.post(buildNoumenaPlatformUrl('/api/ncode_feedback'), {
       content: jsonStringify(data)
     }, {
       headers,
