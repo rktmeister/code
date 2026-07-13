@@ -3,8 +3,9 @@ import type {
   BetaRawMessageStreamEvent,
 } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import { Stream as SDKStream } from '@anthropic-ai/sdk/streaming.mjs'
-import { randomUUID } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import { parseSSEFrames } from '../../cli/transports/SSETransport.js'
+import { TOOL_SEARCH_TOOL_NAME } from '../../tools/ToolSearchTool/constants.js'
 import { errorMessage } from '../../utils/errors.js'
 import type {
   InferenceClient,
@@ -99,6 +100,25 @@ function responseItemKey(item: ResponseItem): string {
   return `${item.type}:value:${JSON.stringify(item)}`
 }
 
+function parseToolArguments(value: unknown): unknown {
+  if (typeof value !== 'string') return value ?? {}
+  try {
+    return JSON.parse(value)
+  } catch {
+    return value
+  }
+}
+
+function toolCallID(item: ResponseItem): string {
+  const callID = item.call_id ?? item.id
+  if (typeof callID !== 'string' || callID.length === 0) {
+    throw new OpenAICompatTransportError(
+      `Responses API ${item.type} item is missing a call_id`,
+    )
+  }
+  return callID
+}
+
 function convertInputBlock(block: unknown): Record<string, unknown> {
   if (!block || typeof block !== 'object' || !('type' in block)) {
     throw new Error('Unsupported empty Responses input content block')
@@ -186,12 +206,102 @@ function convertInputContent(
   return content.map(convertInputBlock)
 }
 
-function convertMessages(messages: unknown): ResponseItem[] {
+function convertFunctionTool(
+  tool: Record<string, unknown>,
+  deferLoading = tool.defer_loading === true,
+): ResponseItem {
+  return {
+    type: 'function',
+    name: tool.name,
+    description: tool.description,
+    parameters: tool.input_schema ?? { type: 'object', properties: {} },
+    ...(tool.strict !== undefined ? { strict: tool.strict } : {}),
+    ...(deferLoading ? { defer_loading: true } : {}),
+  }
+}
+
+function toolMap(tools: unknown): Map<string, Record<string, unknown>> {
+  if (!Array.isArray(tools)) return new Map()
+  return new Map(
+    tools
+      .filter(
+        (tool): tool is Record<string, unknown> =>
+          !!tool &&
+          typeof tool === 'object' &&
+          typeof (tool as Record<string, unknown>).name === 'string',
+      )
+      .map(tool => [String(tool.name), tool]),
+  )
+}
+
+function toolSearchOutput(
+  callID: string,
+  names: string[],
+  toolsByName: Map<string, Record<string, unknown>>,
+): ResponseItem {
+  const selectedTools = names.map(name => {
+    const tool = toolsByName.get(name)
+    if (!tool) {
+      throw new OpenAICompatTransportError(
+        `Tool search selected unavailable tool: ${name}`,
+      )
+    }
+    return convertFunctionTool(tool, true)
+  })
+  return {
+    type: 'tool_search_output',
+    call_id: callID,
+    status: 'completed',
+    execution: 'client',
+    tools: selectedTools,
+  }
+}
+
+function toolReferenceNames(content: unknown): string[] {
+  if (!Array.isArray(content)) return []
+  const names = content
+    .filter(
+      (block): block is { type: 'tool_reference'; tool_name: string } =>
+        !!block &&
+        typeof block === 'object' &&
+        block.type === 'tool_reference' &&
+        typeof block.tool_name === 'string',
+    )
+    .map(block => block.tool_name)
+  return [...new Set(names)]
+}
+
+function functionCallOutput(content: unknown): string | Record<string, unknown>[] {
+  if (!Array.isArray(content)) return convertInputContent(content)
+  const blocks = content.filter(
+    block =>
+      !(
+        block &&
+        typeof block === 'object' &&
+        block.type === 'tool_reference'
+      ),
+  )
+  if (blocks.length > 0) return convertInputContent(blocks)
+  const names = toolReferenceNames(content)
+  return names.length > 0 ? `Loaded tools: ${names.join(', ')}` : ''
+}
+
+function toolSearchCallID(callID: string, names: string[]): string {
+  const digest = createHash('sha256')
+    .update(`${callID}:${names.join(',')}`)
+    .digest('hex')
+    .slice(0, 24)
+  return `ncode_tool_load_${digest}`
+}
+
+function convertMessages(messages: unknown, tools: unknown): ResponseItem[] {
   if (!Array.isArray(messages)) {
     throw new Error('Inference messages must be an array')
   }
   const input: ResponseItem[] = []
   const seenResponseItems = new Set<string>()
+  const loadedToolNames = new Set<string>()
+  const toolsByName = toolMap(tools)
   for (const message of messages) {
     if (!message || typeof message !== 'object' || !('role' in message)) continue
     const raw = (message as Record<string, unknown>)[OPENAI_RESPONSE_ITEMS_FIELD]
@@ -201,6 +311,11 @@ function convertMessages(messages: unknown): ResponseItem[] {
         if (!seenResponseItems.has(key)) {
           seenResponseItems.add(key)
           input.push(item)
+          if (item.type === 'tool_search_output' && Array.isArray(item.tools)) {
+            for (const tool of item.tools as ResponseItem[]) {
+              if (typeof tool.name === 'string') loadedToolNames.add(tool.name)
+            }
+          }
         }
       }
       continue
@@ -216,11 +331,27 @@ function convertMessages(messages: unknown): ResponseItem[] {
             block.type === 'tool_result',
         ) as Array<Record<string, unknown>>
         for (const block of toolResults) {
+          const callID = String(block.tool_use_id ?? '')
           input.push({
             type: 'function_call_output',
             call_id: block.tool_use_id,
-            output: convertInputContent(block.content),
+            output: functionCallOutput(block.content),
           })
+          const names = toolReferenceNames(block.content).filter(
+            name => !loadedToolNames.has(name),
+          )
+          if (names.length > 0) {
+            const searchCallID = toolSearchCallID(callID, names)
+            input.push({
+              type: 'tool_search_call',
+              call_id: searchCallID,
+              status: 'completed',
+              execution: 'client',
+              arguments: { query: names.join(' '), limit: names.length },
+            })
+            input.push(toolSearchOutput(searchCallID, names, toolsByName))
+            for (const name of names) loadedToolNames.add(name)
+          }
         }
         const userContent = content.filter(
           block =>
@@ -323,13 +454,18 @@ function convertOutputFormat(
 
 function convertTools(tools: unknown): ResponseItem[] | undefined {
   if (!Array.isArray(tools) || tools.length === 0) return undefined
-  return tools.map(tool => ({
-    type: 'function',
-    name: tool.name,
-    description: tool.description,
-    parameters: tool.input_schema ?? { type: 'object', properties: {} },
-    ...(tool.strict !== undefined ? { strict: tool.strict } : {}),
-  }))
+  const records = tools as Array<Record<string, unknown>>
+  const searchTool = records.find(tool => tool.name === TOOL_SEARCH_TOOL_NAME)
+  const hasDeferredTools = records.some(tool => tool.defer_loading === true)
+  if (hasDeferredTools && !searchTool) {
+    throw new OpenAICompatTransportError(
+      'Deferred Responses tools require the NCode ToolSearch tool',
+    )
+  }
+  const converted = records
+    .filter(tool => tool.defer_loading !== true)
+    .map(tool => convertFunctionTool(tool, false))
+  return converted.length > 0 ? converted : undefined
 }
 
 export function buildOpenAIResponsesRequest(
@@ -344,7 +480,7 @@ export function buildOpenAIResponsesRequest(
   const parallelToolCalls = convertParallelToolCalls(params.tool_choice)
   return {
     model: params.model,
-    input: convertMessages(params.messages),
+    input: convertMessages(params.messages, params.tools),
     ...(systemText(params.system)
       ? { instructions: systemText(params.system) }
       : {}),
@@ -359,18 +495,6 @@ export function buildOpenAIResponsesRequest(
     include: ['reasoning.encrypted_content'],
     store: false,
     ...(params.stream ? { stream: true } : {}),
-  }
-}
-
-export function buildOpenAIResponsesCompactRequest(
-  params: InferenceCreateMessageArgs[0],
-) {
-  return {
-    model: params.model,
-    input: convertMessages(params.messages),
-    ...(systemText(params.system)
-      ? { instructions: systemText(params.system) }
-      : {}),
   }
 }
 
@@ -416,17 +540,11 @@ function messageFromResponse(response: OpenAIResponse): BetaMessage {
         }
       }
     } else if (item.type === 'function_call') {
-      let input: unknown = {}
-      try {
-        input = JSON.parse(String(item.arguments ?? '{}'))
-      } catch {
-        input = item.arguments
-      }
       content.push({
         type: 'tool_use',
-        id: String(item.call_id ?? item.id ?? randomUUID()),
+        id: toolCallID(item),
         name: String(item.name ?? ''),
-        input,
+        input: parseToolArguments(item.arguments),
       })
     } else if (item.type === 'reasoning' && Array.isArray(item.summary)) {
       const text = (item.summary as Array<Record<string, unknown>>)
@@ -583,12 +701,15 @@ async function* streamEvents(
           }
         } else if (type === 'response.output_item.done') {
           const outputIndex = Number(event.output_index ?? items.length)
-          items[outputIndex] = event.item as ResponseItem
+          const item = event.item as ResponseItem
+          items[outputIndex] = item
         } else if (type === 'response.completed' || type === 'response.incomplete') {
           const r = event.response as OpenAIResponse
           terminalReceived = true
           Object.assign(finalUsage, usage(r.usage))
-          if (r.output?.length) items.splice(0, items.length, ...r.output)
+          if (r.output?.length) {
+            items.splice(0, items.length, ...r.output)
+          }
           const refusal = refusalText(r)
           if (refusal) {
             stopReason = 'refusal'
@@ -666,6 +787,28 @@ function operation<T>(
   })
 }
 
+async function responseError(response: Response): Promise<OpenAICompatHTTPError> {
+  let detail: string | undefined
+  try {
+    const body = (await response.json()) as Record<string, unknown>
+    const nested =
+      body.error && typeof body.error === 'object'
+        ? (body.error as Record<string, unknown>)
+        : undefined
+    const candidate = nested?.message ?? body.message ?? body.detail
+    if (typeof candidate === 'string' && candidate.trim()) {
+      detail = candidate.replace(/\s+/g, ' ').trim().slice(0, 1000)
+    }
+  } catch {
+    // Non-JSON error pages do not contain safe, structured API diagnostics.
+  }
+  return new OpenAICompatHTTPError(
+    response.status,
+    response.statusText,
+    detail,
+  )
+}
+
 export class OpenAIResponsesInferenceClient implements InferenceClient {
   private readonly fetchImpl: FetchLike
   constructor(private readonly options: Options) {
@@ -729,31 +872,10 @@ export class OpenAIResponsesInferenceClient implements InferenceClient {
       options?.headers,
     )
     return operation(responsePromise, async response => {
-      if (!response.ok) throw new OpenAICompatHTTPError(response.status, response.statusText)
+      if (!response.ok) throw await responseError(response)
       if (params.stream) return new SDKStream(() => streamEvents(response, params.model, controller), controller) as never
       return messageFromResponse((await response.json()) as OpenAIResponse) as never
     }) as InferenceCreateMessageResult
-  }
-
-  async compactResponse(
-    params: InferenceCreateMessageArgs[0],
-    options?: InferenceCreateMessageArgs[1],
-  ): Promise<{
-    output: Array<Record<string, unknown>>
-    usage: ReturnType<typeof usage>
-  }> {
-    const request = buildOpenAIResponsesCompactRequest(params)
-    const response = await this.request(
-      '/v1/responses/compact',
-      request,
-      options?.signal,
-      options?.headers,
-    )
-    if (!response.ok) {
-      throw new OpenAICompatHTTPError(response.status, response.statusText)
-    }
-    const body = (await response.json()) as OpenAIResponse
-    return { output: body.output ?? [], usage: usage(body.usage) }
   }
 
   countTokens(...args: InferenceCountTokensArgs): InferenceCountTokensResult {
@@ -776,7 +898,7 @@ export class OpenAIResponsesInferenceClient implements InferenceClient {
       options?.headers,
     ).then(async response => {
       if (!response.ok) {
-        throw new OpenAICompatHTTPError(response.status, response.statusText)
+        throw await responseError(response)
       }
       const body = (await response.json()) as { input_tokens?: number }
       if (typeof body.input_tokens !== 'number') {
@@ -793,6 +915,6 @@ export class OpenAIResponsesInferenceClient implements InferenceClient {
     const headers = new Headers(this.options.headers)
     for (const [key, value] of new Headers(options?.headers).entries()) headers.set(key, value)
     const promise = this.fetchImpl(this.url('/v1/models'), { headers, signal: options?.signal })
-    return { async *[Symbol.asyncIterator]() { const response = await promise; if (!response.ok) throw new OpenAICompatHTTPError(response.status, response.statusText); const body = await response.json() as { data?: Array<Record<string, unknown>> }; for (const item of body.data ?? []) yield item } } as InferenceListModelsResult
+    return { async *[Symbol.asyncIterator]() { const response = await promise; if (!response.ok) throw await responseError(response); const body = await response.json() as { data?: Array<Record<string, unknown>> }; for (const item of body.data ?? []) yield item } } as InferenceListModelsResult
   }
 }

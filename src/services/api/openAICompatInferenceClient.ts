@@ -64,12 +64,16 @@ export class OpenAICompatMalformedToolOutputError extends Error {
 export class OpenAICompatHTTPError extends Error {
   readonly status: number
   readonly statusText: string
+  readonly detail?: string
 
-  constructor(status: number, statusText: string) {
-    super(`OpenAI compat inference request failed: ${status} ${statusText}`)
+  constructor(status: number, statusText: string, detail?: string) {
+    super(
+      `OpenAI compat inference request failed: ${status} ${statusText}${detail ? `: ${detail}` : ''}`,
+    )
     this.name = 'OpenAICompatHTTPError'
     this.status = status
     this.statusText = statusText
+    this.detail = detail
   }
 }
 

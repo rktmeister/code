@@ -57,6 +57,23 @@ export function getOpenAIApiFormat(): OpenAIApiFormat {
   )
 }
 
+export function isOpenAIResponsesActive(): boolean {
+  return isOpenAICompatByokActive() && getOpenAIApiFormat() === 'responses'
+}
+
+/** OpenAI Responses tool search is available on GPT-5.4 and later models. */
+export function modelSupportsOpenAIResponsesToolSearch(model: string): boolean {
+  const match = model
+    .trim()
+    .toLowerCase()
+    .match(/(?:^|[/:])gpt-(\d+)(?:\.(\d+))?/)
+  if (!match) return false
+
+  const major = Number(match[1])
+  const minor = Number(match[2] ?? 0)
+  return major > 5 || (major === 5 && minor >= 4)
+}
+
 export function getFirstPartyBaseUrlOverride(): string | undefined {
   return getNoumenaBaseUrl() ?? getAnthropicBaseUrl()
 }

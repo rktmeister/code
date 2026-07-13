@@ -48,35 +48,6 @@ export interface InferenceClient {
   createMessage(...args: InferenceCreateMessageArgs): InferenceCreateMessageResult
   countTokens(...args: InferenceCountTokensArgs): InferenceCountTokensResult
   listModels(...args: InferenceListModelsArgs): InferenceListModelsResult
-  compactResponse?(
-    params: InferenceCreateMessageArgs[0],
-    options?: InferenceCreateMessageArgs[1],
-  ): Promise<{ output: Array<Record<string, unknown>>; usage?: unknown }>
-}
-
-export function assertCompactedStateCompatible(
-  client: InferenceClient,
-  messages: unknown[],
-): void {
-  if (client.compactResponse) return
-  const hasResponsesCompaction = messages.some(message => {
-    if (!message || typeof message !== 'object') return false
-    const items = (message as Record<string, unknown>)._openai_response_items
-    return (
-      Array.isArray(items) &&
-      items.some(
-        item =>
-          item &&
-          typeof item === 'object' &&
-          (item as Record<string, unknown>).type === 'compaction',
-      )
-    )
-  })
-  if (hasResponsesCompaction) {
-    throw new Error(
-      'This session contains OpenAI Responses compacted state that the selected API transport cannot replay. Resume it with the same OpenAI Responses provider, including OPENAI_API_FORMAT=responses, or start a new session before switching providers.',
-    )
-  }
 }
 
 class AnthropicInferenceClient implements InferenceClient {

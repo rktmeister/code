@@ -161,6 +161,7 @@ import {
 import type { QuerySource } from '../constants/querySource.js'
 import {
   getDeferredToolsDelta,
+  getToolSearchProtocol,
   isDeferredToolsDeltaEnabled,
   isToolSearchEnabledOptimistic,
   isToolSearchToolAvailable,
@@ -1464,6 +1465,7 @@ export function getDeferredToolsDeltaAttachment(
   messages: Message[] | undefined,
   scanContext?: DeferredToolsDeltaScanContext,
 ): Attachment[] {
+  if (getToolSearchProtocol() === 'openai-responses') return []
   if (!isDeferredToolsDeltaEnabled()) return []
   // These three checks mirror the sync parts of isToolSearchEnabled —
   // the attachment text says "available via ToolSearch", so ToolSearch
@@ -1575,6 +1577,7 @@ export function getMcpInstructionsDeltaAttachment(
   // here, pass it into the pure diff as a synthesized entry.
   const clientSide: ClientSideInstruction[] = []
   if (
+    getToolSearchProtocol() === 'anthropic' &&
     isToolSearchEnabledOptimistic() &&
     modelSupportsToolReference(model) &&
     isToolSearchToolAvailable(tools)

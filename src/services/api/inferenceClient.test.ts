@@ -2,10 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import {
-  assertCompactedStateCompatible,
-  getInferenceClient,
-} from './inferenceClient.js'
+import { getInferenceClient } from './inferenceClient.js'
 import { OpenAICompatInferenceClient } from './openAICompatInferenceClient.js'
 import { OpenAIResponsesInferenceClient } from './openAIResponsesInferenceClient.js'
 import { enableConfigs } from '../../utils/config.js'
@@ -482,37 +479,4 @@ describe('getInferenceClient', () => {
     )
   })
 
-})
-
-describe('assertCompactedStateCompatible', () => {
-  const incompatibleClient = {} as never
-  const responsesClient = { compactResponse: async () => ({ output: [] }) } as never
-
-  it('rejects only native compaction state on incompatible transports', () => {
-    expect(() =>
-      assertCompactedStateCompatible(incompatibleClient, [
-        {
-          role: 'assistant',
-          _openai_response_items: [
-            { type: 'reasoning', encrypted_content: 'opaque' },
-          ],
-        },
-      ]),
-    ).not.toThrow()
-
-    const compactedMessages = [
-      {
-        role: 'user',
-        _openai_response_items: [
-          { type: 'compaction', encrypted_content: 'opaque' },
-        ],
-      },
-    ]
-    expect(() =>
-      assertCompactedStateCompatible(incompatibleClient, compactedMessages),
-    ).toThrow('cannot replay')
-    expect(() =>
-      assertCompactedStateCompatible(responsesClient, compactedMessages),
-    ).not.toThrow()
-  })
 })

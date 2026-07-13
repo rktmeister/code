@@ -170,6 +170,7 @@ function getTeammateMailbox(): typeof import('./teammateMailbox.js') {
 }
 
 import {
+  getToolSearchProtocol,
   isToolReferenceBlock,
   isToolSearchEnabledOptimistic,
 } from './toolSearch.js'
@@ -2157,6 +2158,7 @@ export function normalizeMessagesForAPI(
           // that gets relocated, so skipping it saves a scan. When gate is
           // off, this is the fallback (same as pre-#21049 main).
           if (
+            getToolSearchProtocol() === 'anthropic' &&
             !checkStatsigFeatureGate_CACHED_MAY_BE_STALE(
               'ncode_toolref_defer_j8m',
             )
@@ -2298,11 +2300,11 @@ export function normalizeMessagesForAPI(
   // Runs after merge (siblings are in place) and before ID tagging (so
   // tags reflect final positions). When gate is OFF, this is a noop and
   // the TOOL_REFERENCE_TURN_BOUNDARY injection above serves as fallback.
-  const relocated = checkStatsigFeatureGate_CACHED_MAY_BE_STALE(
-    'ncode_toolref_defer_j8m',
-  )
-    ? relocateToolReferenceSiblings(result)
-    : result
+  const relocated =
+    getToolSearchProtocol() === 'anthropic' &&
+    checkStatsigFeatureGate_CACHED_MAY_BE_STALE('ncode_toolref_defer_j8m')
+      ? relocateToolReferenceSiblings(result)
+      : result
 
   // Filter orphaned thinking-only assistant messages (likely introduced by
   // compaction slicing away intervening messages between a failed streaming
@@ -2390,11 +2392,24 @@ export function mergeAssistantMessages(
   a: AssistantMessage,
   b: AssistantMessage,
 ): AssistantMessage {
+  const aResponseItems = (
+    a.message as unknown as Record<string, unknown>
+  )._openai_response_items
+  const bResponseItems = (
+    b.message as unknown as Record<string, unknown>
+  )._openai_response_items
+  const responseItems =
+    Array.isArray(bResponseItems) && bResponseItems.length > 0
+      ? bResponseItems
+      : aResponseItems
   return {
     ...a,
     message: {
       ...a.message,
       content: [...a.message.content, ...b.message.content],
+      ...(Array.isArray(responseItems)
+        ? { _openai_response_items: responseItems }
+        : {}),
     },
   }
 }

@@ -45,9 +45,216 @@ describe('OpenAIResponsesInferenceClient', () => {
     })
   })
 
+  it('keeps the local search function immediate without exposing deferred schemas', () => {
+    const request = buildOpenAIResponsesRequest({
+      model: 'gpt-5.4',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'find the repository tool' }],
+      tools: [
+        {
+          name: 'Read',
+          description: 'Read a file',
+          input_schema: { type: 'object', properties: {} },
+        },
+        {
+          name: 'RepositorySearch',
+          description: 'Search a repository',
+          input_schema: {
+            type: 'object',
+            properties: { query: { type: 'string' } },
+            required: ['query'],
+          },
+          defer_loading: true,
+        },
+        {
+          name: 'ToolSearch',
+          description: 'Find deferred tools',
+          input_schema: {
+            type: 'object',
+            properties: { query: { type: 'string' } },
+            required: ['query'],
+            additionalProperties: false,
+          },
+        },
+      ],
+    } as never)
+
+    expect(request.tools).toEqual([
+      {
+        type: 'function',
+        name: 'Read',
+        description: 'Read a file',
+        parameters: { type: 'object', properties: {} },
+      },
+      {
+        type: 'function',
+        name: 'ToolSearch',
+        description: 'Find deferred tools',
+        parameters: {
+          type: 'object',
+          properties: { query: { type: 'string' } },
+          required: ['query'],
+          additionalProperties: false,
+        },
+      },
+    ])
+  })
+
+  it('rejects deferred tools without a client search executor', () => {
+    expect(() =>
+      buildOpenAIResponsesRequest({
+        model: 'gpt-5.4',
+        max_tokens: 100,
+        messages: [{ role: 'user', content: 'find a tool' }],
+        tools: [
+          {
+            name: 'RepositorySearch',
+            description: 'Search a repository',
+            input_schema: { type: 'object', properties: {} },
+            defer_loading: true,
+          },
+        ],
+      } as never),
+    ).toThrow('Deferred Responses tools require the NCode ToolSearch tool')
+  })
+
+  it('records locally loaded tools as client tool-search items', async () => {
+    const output = [
+      {
+        type: 'function_call',
+        id: 'fc-search-call-1',
+        call_id: 'search-call-1',
+        name: 'ToolSearch',
+        arguments: '{"query":"repository"}',
+      },
+    ]
+    const client = new OpenAIResponsesInferenceClient({
+      baseURL: 'https://proxy.example.test/v1',
+      fetch: async () =>
+        Response.json({
+          id: 'response-1',
+          model: 'gpt-5.4',
+          status: 'completed',
+          output,
+        }),
+    })
+
+    const assistant = await client.createMessage({
+      model: 'gpt-5.4',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'search the repository' }],
+    })
+    expect(assistant.content).toEqual([
+      {
+        type: 'tool_use',
+        id: 'search-call-1',
+        name: 'ToolSearch',
+        input: { query: 'repository' },
+      },
+    ])
+    const nextRequest = buildOpenAIResponsesRequest({
+      model: 'gpt-5.4',
+      max_tokens: 100,
+      messages: [
+        assistant,
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'search-call-1',
+              content: [
+                {
+                  type: 'tool_reference',
+                  tool_name: 'RepositorySearch',
+                },
+              ],
+            },
+          ],
+        },
+      ],
+      tools: [
+        {
+          name: 'RepositorySearch',
+          description: 'Search a repository',
+          input_schema: { type: 'object', properties: {} },
+          defer_loading: true,
+        },
+        {
+          name: 'ToolSearch',
+          description: 'Find deferred tools',
+          input_schema: {
+            type: 'object',
+            properties: { query: { type: 'string' } },
+            required: ['query'],
+          },
+        },
+      ],
+    } as never)
+
+    expect(nextRequest.input).toEqual([
+      ...output,
+      {
+        type: 'function_call_output',
+        call_id: 'search-call-1',
+        output: 'Loaded tools: RepositorySearch',
+      },
+      {
+        type: 'tool_search_call',
+        call_id: 'ncode_tool_load_e19ccfda1cdd13a9f872fcd7',
+        status: 'completed',
+        execution: 'client',
+        arguments: { query: 'RepositorySearch', limit: 1 },
+      },
+      {
+        type: 'tool_search_output',
+        call_id: 'ncode_tool_load_e19ccfda1cdd13a9f872fcd7',
+        status: 'completed',
+        execution: 'client',
+        tools: [
+          {
+            type: 'function',
+            name: 'RepositorySearch',
+            description: 'Search a repository',
+            parameters: { type: 'object', properties: {} },
+            defer_loading: true,
+          },
+        ],
+      },
+    ])
+    expect(nextRequest.tools).toEqual([
+      {
+        type: 'function',
+        name: 'ToolSearch',
+        description: 'Find deferred tools',
+        parameters: {
+          type: 'object',
+          properties: { query: { type: 'string' } },
+          required: ['query'],
+        },
+      },
+    ])
+  })
+
   it('replays native output items without translating them', () => {
     const items = [
       { type: 'reasoning', id: 'r1', encrypted_content: 'opaque' },
+      {
+        type: 'tool_search_call',
+        id: 'tsc1',
+        call_id: 'tsc1',
+        execution: 'client',
+        status: 'completed',
+        arguments: { query: 'read' },
+      },
+      {
+        type: 'tool_search_output',
+        id: 'tso1',
+        call_id: 'tsc1',
+        execution: 'client',
+        status: 'completed',
+        tools: [{ type: 'function', name: 'Read' }],
+      },
       {
         type: 'function_call',
         call_id: 'c1',
@@ -321,6 +528,27 @@ describe('OpenAIResponsesInferenceClient', () => {
     })
   })
 
+  it('surfaces structured API error details', async () => {
+    const client = new OpenAIResponsesInferenceClient({
+      baseURL: 'https://proxy.example.test/v1',
+      fetch: async () =>
+        Response.json(
+          { error: { message: 'Unsupported tool_search execution mode' } },
+          { status: 400, statusText: 'Bad Request' },
+        ),
+    })
+
+    expect(
+      client.createMessage({
+        model: 'gpt-test',
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'request' }],
+      }),
+    ).rejects.toThrow(
+      '400 Bad Request: Unsupported tool_search execution mode',
+    )
+  })
+
   it('rejects a stream that reaches EOF without a terminal event', async () => {
     const frames = [
       { type: 'response.created', response: { id: 'resp-1', model: 'gpt-test' } },
@@ -537,52 +765,6 @@ describe('OpenAIResponsesInferenceClient', () => {
         delta: expect.objectContaining({ stop_reason: 'max_tokens' }),
       }),
     )
-  })
-
-  it('uses the standalone compact endpoint and returns its canonical output', async () => {
-    let url = ''
-    let body: Record<string, unknown> = {}
-    const client = new OpenAIResponsesInferenceClient({
-      baseURL: 'https://proxy.example.test/v1',
-      fetch: async (input, init) => {
-        url = String(input)
-        body = JSON.parse(String(init?.body))
-        return Response.json({
-          object: 'response.compaction',
-          output: [{ type: 'compaction', encrypted_content: 'opaque' }],
-          usage: { input_tokens: 100, output_tokens: 20 },
-        })
-      },
-    })
-    const compacted = await client.compactResponse({
-      model: 'gpt-test',
-      max_tokens: 100,
-      system: [{ type: 'text', text: 'system' }],
-      messages: [{ role: 'user', content: 'history' }],
-      tools: [
-        {
-          name: 'Read',
-          description: 'Read a file',
-          input_schema: { type: 'object', properties: {} },
-        },
-      ],
-      tool_choice: { type: 'auto', disable_parallel_tool_use: true },
-      thinking: { type: 'enabled', budget_tokens: 1000 },
-      output_config: { effort: 'high' },
-    })
-    expect(url).toBe('https://proxy.example.test/v1/responses/compact')
-    expect(body).toEqual({
-      model: 'gpt-test',
-      input: [{ type: 'message', role: 'user', content: 'history' }],
-      instructions: 'system',
-    })
-    expect(compacted.output).toEqual([
-      { type: 'compaction', encrypted_content: 'opaque' },
-    ])
-    expect(compacted.usage).toMatchObject({
-      input_tokens: 100,
-      output_tokens: 20,
-    })
   })
 
   it('counts the complete request with the native input-token endpoint', async () => {

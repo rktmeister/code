@@ -1,9 +1,9 @@
 /**
  * Tool Search utilities for dynamically discovering deferred tools.
  *
- * When enabled, deferred tools (MCP and shouldDefer tools) are sent with
- * defer_loading: true and discovered via ToolSearchTool rather than being
- * loaded upfront.
+ * When enabled, deferred tools (MCP and shouldDefer tools) are discovered
+ * through the active inference transport's native protocol rather than being
+ * loaded into model context upfront.
  */
 
 import memoize from 'lodash-es/memoize.js'
@@ -37,7 +37,9 @@ import { isEnvDefinedFalsy, isEnvTruthy } from './envUtils.js'
 import {
   getAPIProvider,
   getFirstPartyBaseUrlOverride,
+  isOpenAIResponsesActive,
   isFirstPartyNoumenaBaseUrl,
+  modelSupportsOpenAIResponsesToolSearch,
 } from './model/providers.js'
 import { jsonStringify } from './slowOperations.js'
 import { zodToJsonSchema } from './zodToJsonSchema.js'
@@ -156,11 +158,16 @@ const getDeferredToolTokenCount = memoize(
 /**
  * Tool search mode. Determines how deferrable tools (MCP + shouldDefer) are
  * surfaced:
- *   - 'tst': Tool Search Tool — deferred tools discovered via ToolSearchTool (always enabled)
+ *   - 'tst': deferred tools use the active transport's search protocol
  *   - 'tst-auto': auto — tools deferred only when they exceed threshold
  *   - 'standard': tool search disabled — all tools exposed inline
  */
 export type ToolSearchMode = 'tst' | 'tst-auto' | 'standard'
+export type ToolSearchProtocol = 'anthropic' | 'openai-responses'
+
+export function getToolSearchProtocol(): ToolSearchProtocol {
+  return isOpenAIResponsesActive() ? 'openai-responses' : 'anthropic'
+}
 
 /**
  * Determines the tool search mode from ENABLE_TOOL_SEARCH.
@@ -367,17 +374,17 @@ async function calculateDeferredToolDescriptionChars(
 }
 
 /**
- * Check if tool search (MCP tool deferral with tool_reference) is enabled for a specific request.
+ * Check if tool search is enabled for a specific request.
  *
  * This is the definitive check that includes:
  * - MCP mode (Tst, TstAuto, McpCli, Standard)
- * - Model compatibility (haiku doesn't support tool_reference)
- * - ToolSearchTool availability (must be in tools list)
+ * - Model compatibility with the active transport's tool-search protocol
+ * - ToolSearchTool availability as the user-facing policy gate
  * - Threshold check for TstAuto mode
  *
  * Use this when making actual API calls where all context is available.
  *
- * @param model The model to check for tool_reference support
+ * @param model The model to check for transport-specific tool-search support
  * @param tools Array of available tools (including MCP tools)
  * @param getToolPermissionContext Function to get tool permission context
  * @param agents Array of agent definitions
@@ -392,6 +399,7 @@ export async function isToolSearchEnabled(
   source?: string,
 ): Promise<boolean> {
   const mcpToolCount = count(tools, t => t.isMcp)
+  const protocol = getToolSearchProtocol()
 
   // Helper to log the mode decision event
   function logModeDecision(
@@ -417,11 +425,13 @@ export async function isToolSearchEnabled(
     })
   }
 
-  // Check if model supports tool_reference
-  if (!modelSupportsToolReference(model)) {
+  const modelSupported =
+    protocol === 'openai-responses'
+      ? modelSupportsOpenAIResponsesToolSearch(model)
+      : modelSupportsToolReference(model)
+  if (!modelSupported) {
     logForDebugging(
-      `Tool search disabled for model '${model}': model does not support tool_reference blocks. ` +
-        `This feature is only available on balanced/reasoning families and newer models.`,
+      `Tool search disabled for model '${model}': model does not support the ${protocol} tool-search protocol.`,
     )
     logModeDecision(false, 'standard', 'model_unsupported')
     return false

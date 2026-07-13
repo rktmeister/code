@@ -187,6 +187,7 @@ import {
 } from 'src/utils/thinking.js'
 import {
   extractDiscoveredToolNames,
+  getToolSearchProtocol,
   isDeferredToolsDeltaEnabled,
   isToolSearchEnabled,
 } from 'src/utils/toolSearch.js'
@@ -231,10 +232,7 @@ import { getInitializationStatus } from '../lsp/manager.js'
 import { isToolFromMcpServer } from '../mcp/utils.js'
 import { withStreamingVCR, withVCR } from '../vcr.js'
 import { CLIENT_REQUEST_ID_HEADER } from './client.js'
-import {
-  assertCompactedStateCompatible,
-  getInferenceClient,
-} from './inferenceClient.js'
+import { getInferenceClient } from './inferenceClient.js'
 import { isInternalBuild } from 'src/capabilities/static.js'
 import {
   API_ERROR_MESSAGE_PREFIX,
@@ -913,8 +911,6 @@ export async function* executeNonStreamingRequest(
         MAX_NON_STREAMING_TOKENS,
       )
 
-      assertCompactedStateCompatible(inferenceClient, adjustedParams.messages)
-
       try {
         // biome-ignore lint/plugin: non-streaming API call
         return await inferenceClient.createMessage(
@@ -1171,6 +1167,8 @@ async function* queryModel(
     }
   }
 
+  const toolSearchProtocol = getToolSearchProtocol()
+
   // Check if tool search is enabled (checks mode, model support, and threshold for auto mode)
   // This is async because it may need to calculate MCP tool description sizes for TstAuto mode
   let useToolSearch = await isToolSearchEnabled(
@@ -1203,11 +1201,18 @@ async function* queryModel(
     useToolSearch = false
   }
 
-  // Filter out ToolSearchTool if tool search is not enabled for this model
-  // ToolSearchTool returns tool_reference blocks which unsupported models can't handle
+  const useOpenAIResponsesToolSearch =
+    useToolSearch && toolSearchProtocol === 'openai-responses'
+
+  // Choose the tool inventory required by the active search protocol.
   let filteredTools: Tools
 
-  if (useToolSearch) {
+  if (useOpenAIResponsesToolSearch) {
+    // Keep the complete local inventory so the Responses adapter can turn
+    // ToolSearch results into client tool-search records containing the
+    // selected schemas. Deferred definitions stay out of the top-level list.
+    filteredTools = tools
+  } else if (useToolSearch) {
     // Dynamic tool loading: Only include deferred tools that have been discovered
     // via tool_reference blocks in the message history. This eliminates the need
     // to predeclare all deferred tools upfront and removes limits on tool quantity.
@@ -1227,10 +1232,13 @@ async function* queryModel(
     )
   }
 
-  // Add tool search beta header if enabled - required for defer_loading to be accepted
+  // Anthropic transports require a beta header for defer_loading.
   // Header differs by provider: 1P/Foundry use advanced-tool-use, Vertex/Bedrock use tool-search-tool
   // For Bedrock, this header must go in extraBodyParams, not the betas array
-  const toolSearchHeader = useToolSearch ? getToolSearchBetaHeader() : null
+  const toolSearchHeader =
+    useToolSearch && !useOpenAIResponsesToolSearch
+      ? getToolSearchBetaHeader()
+      : null
   if (toolSearchHeader && getAPIProvider() !== 'bedrock') {
     if (!betas.includes(toolSearchHeader)) {
       betas.push(toolSearchHeader)
@@ -1319,7 +1327,18 @@ async function* queryModel(
   })
 
   queryCheckpoint('query_message_normalization_start')
-  let messagesForAPI = normalizeMessagesForAPI(messages, filteredTools)
+  const messagesForNormalization =
+    toolSearchProtocol === 'openai-responses'
+      ? messages.filter(
+          message =>
+            message.type !== 'attachment' ||
+            message.attachment.type !== 'deferred_tools_delta',
+        )
+      : messages
+  let messagesForAPI = normalizeMessagesForAPI(
+    messagesForNormalization,
+    filteredTools,
+  )
   queryCheckpoint('query_message_normalization_end')
 
   // Model-specific post-processing: strip tool-search-specific fields if the
@@ -1383,7 +1402,11 @@ async function* queryModel(
   // When the delta attachment is enabled, deferred tools are announced
   // via persisted deferred_tools_delta attachments instead of this
   // ephemeral prepend (which busts cache whenever the pool changes).
-  if (useToolSearch && !isDeferredToolsDeltaEnabled()) {
+  if (
+    useToolSearch &&
+    !useOpenAIResponsesToolSearch &&
+    !isDeferredToolsDeltaEnabled()
+  ) {
     const deferredToolList = tools
       .filter(t => deferredToolNames.has(t.name))
       .map(formatDeferredToolLine)
@@ -1408,7 +1431,10 @@ async function* queryModel(
     isToolFromMcpServer(t.name, CLAUDE_IN_CHROME_MCP_SERVER_NAME),
   )
   const injectChromeHere =
-    useToolSearch && hasChromeTools && !isMcpInstructionsDeltaEnabled()
+    useToolSearch &&
+    !useOpenAIResponsesToolSearch &&
+    hasChromeTools &&
+    !isMcpInstructionsDeltaEnabled()
 
   // filter(Boolean) works by converting each element to a boolean - empty strings become false and are filtered out.
   systemPrompt = asSystemPrompt(
@@ -1851,7 +1877,6 @@ async function* queryModel(
         queryCheckpoint('query_client_creation_end')
 
         const params = paramsFromContext(context)
-        assertCompactedStateCompatible(inferenceClient, params.messages)
         captureAPIRequest(params, options.querySource) // Capture for bug reports
 
         maxOutputTokens = params.max_tokens
