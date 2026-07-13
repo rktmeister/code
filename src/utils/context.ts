@@ -8,8 +8,15 @@ import { getModelCapability } from './model/modelCapabilities.js'
 import { resolveNCodeManagedModel } from './model/ncodeModels.js'
 import { isInternalBuild } from 'src/capabilities/static.js'
 
-// Model context window size (200k tokens for all models right now)
+// Fallback context window size for models without a known token contract.
 export const MODEL_CONTEXT_WINDOW_DEFAULT = 200_000
+
+// GPT-5.6 has a larger API context window, but the Codex client deliberately
+// uses a smaller working window so compaction happens before long-context
+// performance degrades.
+export const GPT_5_6_CONTEXT_WINDOW = 372_000
+export const GPT_5_6_EFFECTIVE_CONTEXT_WINDOW = 353_400
+export const GPT_5_6_AUTO_COMPACT_THRESHOLD = 334_800
 
 // Maximum output tokens for compact operations
 export const COMPACT_MAX_OUTPUT_TOKENS = 20_000
@@ -40,6 +47,10 @@ export function has1mContext(model: string): boolean {
     return false
   }
   return /\[1m\]/i.test(model)
+}
+
+export function isGpt56Model(model: string): boolean {
+  return /^gpt-5\.6-(?:sol|terra|luna)(?:\([^()]+\))?$/i.test(model.trim())
 }
 
 // @[MODEL LAUNCH]: Update this pattern if the new model supports 1M context
@@ -78,6 +89,10 @@ export function getContextWindowForModel(
   const ncodeModel = resolveNCodeManagedModel(model)
   if (ncodeModel) {
     return ncodeModel.contextWindow
+  }
+
+  if (isGpt56Model(model)) {
+    return GPT_5_6_CONTEXT_WINDOW
   }
 
   // [1m] suffix — explicit client-side opt-in for unmanaged Anthropic models.

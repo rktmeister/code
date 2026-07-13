@@ -5,7 +5,12 @@ import type { QuerySource } from '../../constants/querySource.js'
 import type { ToolUseContext } from '../../Tool.js'
 import type { Message } from '../../types/message.js'
 import { getGlobalConfig } from '../../utils/config.js'
-import { getContextWindowForModel } from '../../utils/context.js'
+import {
+  getContextWindowForModel,
+  GPT_5_6_AUTO_COMPACT_THRESHOLD,
+  GPT_5_6_EFFECTIVE_CONTEXT_WINDOW,
+  isGpt56Model,
+} from '../../utils/context.js'
 import { logForDebugging } from '../../utils/debug.js'
 import { isEnvTruthy } from '../../utils/envUtils.js'
 import { hasExactErrorMessage } from '../../utils/errors.js'
@@ -48,6 +53,10 @@ export function getEffectiveContextWindowSize(model: string): number {
     return contextWindow
   }
 
+  if (isGpt56Model(model)) {
+    return Math.min(contextWindow, GPT_5_6_EFFECTIVE_CONTEXT_WINDOW)
+  }
+
   const reservedTokensForSummary = Math.min(
     getMaxOutputTokensForModel(model),
     MAX_OUTPUT_TOKENS_FOR_SUMMARY,
@@ -80,8 +89,9 @@ const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
 export function getAutoCompactThreshold(model: string): number {
   const effectiveContextWindow = getEffectiveContextWindowSize(model)
 
-  const autocompactThreshold =
-    effectiveContextWindow - AUTOCOMPACT_BUFFER_TOKENS
+  const autocompactThreshold = isGpt56Model(model)
+    ? Math.min(effectiveContextWindow, GPT_5_6_AUTO_COMPACT_THRESHOLD)
+    : effectiveContextWindow - AUTOCOMPACT_BUFFER_TOKENS
 
   // Override for easier testing of autocompact
   const envPercent = process.env.CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
