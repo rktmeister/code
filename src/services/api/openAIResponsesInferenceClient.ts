@@ -38,6 +38,8 @@ type OpenAIResponse = {
   usage?: ResponseUsage | null
 }
 
+type ResponsesStopReason = 'tool_use' | 'max_tokens' | 'end_turn' | 'refusal'
+
 type Options = {
   baseURL: string
   fetch?: FetchLike
@@ -360,6 +362,34 @@ export function buildOpenAIResponsesRequest(
   }
 }
 
+export function buildOpenAIResponsesCompactRequest(
+  params: InferenceCreateMessageArgs[0],
+) {
+  return {
+    model: params.model,
+    input: convertMessages(params.messages),
+    ...(systemText(params.system)
+      ? { instructions: systemText(params.system) }
+      : {}),
+  }
+}
+
+function incompleteStopReason(
+  response: OpenAIResponse,
+): Extract<ResponsesStopReason, 'max_tokens' | 'refusal'> | undefined {
+  if (response.status !== 'incomplete') return undefined
+  switch (response.incomplete_details?.reason) {
+    case 'max_output_tokens':
+      return 'max_tokens'
+    case 'content_filter':
+      return 'refusal'
+    default:
+      throw new OpenAICompatTransportError(
+        `Responses API returned an incomplete response without a supported reason: ${String(response.incomplete_details?.reason)}`,
+      )
+  }
+}
+
 function refusalText(response: OpenAIResponse): string {
   return (response.output ?? [])
     .flatMap(item =>
@@ -375,6 +405,7 @@ function refusalText(response: OpenAIResponse): string {
 function messageFromResponse(response: OpenAIResponse): BetaMessage {
   const content: Array<Record<string, unknown>> = []
   const refusal = refusalText(response)
+  const incompleteReason = incompleteStopReason(response)
   for (const item of response.output ?? []) {
     if (item.type === 'message' && Array.isArray(item.content)) {
       for (const part of item.content as Array<Record<string, unknown>>) {
@@ -414,9 +445,7 @@ function messageFromResponse(response: OpenAIResponse): BetaMessage {
       ? 'refusal'
       : content.some(block => block.type === 'tool_use')
       ? 'tool_use'
-      : response.status === 'incomplete'
-        ? 'max_tokens'
-        : 'end_turn',
+      : (incompleteReason ?? 'end_turn'),
     stop_sequence: null,
     usage: usage(response.usage),
     [OPENAI_RESPONSE_ITEMS_FIELD]: response.output ?? [],
@@ -440,8 +469,7 @@ async function* streamEvents(
   const tools = new Map<number, { index: number; id: string; name: string }>()
   const items: ResponseItem[] = []
   let finalUsage = usage()
-  let stopReason: 'tool_use' | 'max_tokens' | 'end_turn' | 'refusal' =
-    'end_turn'
+  let stopReason: ResponsesStopReason = 'end_turn'
   let terminalReceived = false
 
   yield {
@@ -460,7 +488,7 @@ async function* streamEvents(
   } as unknown as BetaRawMessageStreamEvent
 
   try {
-    while (true) {
+    streamLoop: while (true) {
       const { done, value } = await reader.read()
       buffer += decoder.decode(value ?? new Uint8Array(), { stream: !done })
       const parsed = parseSSEFrames(buffer)
@@ -556,13 +584,6 @@ async function* streamEvents(
         } else if (type === 'response.output_item.done') {
           const outputIndex = Number(event.output_index ?? items.length)
           items[outputIndex] = event.item as ResponseItem
-          const state = tools.get(outputIndex)
-          if (state) {
-            yield {
-              type: 'content_block_stop',
-              index: state.index,
-            } as BetaRawMessageStreamEvent
-          }
         } else if (type === 'response.completed' || type === 'response.incomplete') {
           const r = event.response as OpenAIResponse
           terminalReceived = true
@@ -584,9 +605,8 @@ async function* streamEvents(
                 delta: { type: 'text_delta', text: refusal },
               } as BetaRawMessageStreamEvent
             }
-          } else if (r.status === 'incomplete') {
-            stopReason = 'max_tokens'
-          }
+          } else stopReason = incompleteStopReason(r) ?? stopReason
+          break streamLoop
         } else if (type === 'error' || type === 'response.failed') {
           throw new Error(
             `Responses API stream failed: ${JSON.stringify(event.error ?? event)}`,
@@ -596,13 +616,21 @@ async function* streamEvents(
       if (done) break
     }
   } finally {
-    if (controller.signal.aborted) void reader.cancel().catch(() => {})
+    if (terminalReceived || controller.signal.aborted) {
+      await reader.cancel().catch(() => {})
+    }
     reader.releaseLock()
   }
   if (!terminalReceived) {
     throw new OpenAICompatTransportError(
       'Responses API stream ended before a terminal response event',
     )
+  }
+  for (const state of tools.values()) {
+    yield {
+      type: 'content_block_stop',
+      index: state.index,
+    } as BetaRawMessageStreamEvent
   }
   if (thinkingIndex !== undefined) {
     yield {
@@ -714,7 +742,7 @@ export class OpenAIResponsesInferenceClient implements InferenceClient {
     output: Array<Record<string, unknown>>
     usage: ReturnType<typeof usage>
   }> {
-    const request = buildOpenAIResponsesRequest({ ...params, stream: false })
+    const request = buildOpenAIResponsesCompactRequest(params)
     const response = await this.request(
       '/v1/responses/compact',
       request,

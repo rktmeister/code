@@ -231,7 +231,10 @@ import { getInitializationStatus } from '../lsp/manager.js'
 import { isToolFromMcpServer } from '../mcp/utils.js'
 import { withStreamingVCR, withVCR } from '../vcr.js'
 import { CLIENT_REQUEST_ID_HEADER } from './client.js'
-import { getInferenceClient } from './inferenceClient.js'
+import {
+  assertCompactedStateCompatible,
+  getInferenceClient,
+} from './inferenceClient.js'
 import { isInternalBuild } from 'src/capabilities/static.js'
 import {
   API_ERROR_MESSAGE_PREFIX,
@@ -909,6 +912,8 @@ export async function* executeNonStreamingRequest(
         retryParams,
         MAX_NON_STREAMING_TOKENS,
       )
+
+      assertCompactedStateCompatible(inferenceClient, adjustedParams.messages)
 
       try {
         // biome-ignore lint/plugin: non-streaming API call
@@ -1846,6 +1851,7 @@ async function* queryModel(
         queryCheckpoint('query_client_creation_end')
 
         const params = paramsFromContext(context)
+        assertCompactedStateCompatible(inferenceClient, params.messages)
         captureAPIRequest(params, options.querySource) // Capture for bug reports
 
         maxOutputTokens = params.max_tokens
@@ -2292,14 +2298,43 @@ async function* queryModel(
             // captures the final values.
             stopReason = part.delta.stop_reason
 
-            const lastMsg = newMessages.at(-1)
+            const responseItems = partialMessage
+              ? (
+                  partialMessage as unknown as Record<string, unknown>
+                )._openai_response_items
+              : undefined
+            let lastMsg = newMessages.at(-1)
+            let metadataOnlyMessage: AssistantMessage | undefined
+            // Responses can complete with only opaque reasoning state. Persist
+            // an empty assistant envelope so the next turn can replay it.
+            if (
+              !lastMsg &&
+              Array.isArray(responseItems) &&
+              responseItems.length > 0 &&
+              partialMessage
+            ) {
+              metadataOnlyMessage = {
+                message: {
+                  ...partialMessage,
+                  content: [],
+                  usage,
+                  stop_reason: stopReason,
+                },
+                requestId: streamRequestId ?? undefined,
+                type: 'assistant',
+                uuid: randomUUID(),
+                timestamp: new Date().toISOString(),
+                ...(isInternalBuild() &&
+                  research !== undefined && { research }),
+                ...(advisorModel && { advisorModel }),
+              }
+              lastMsg = metadataOnlyMessage
+              newMessages.push(lastMsg)
+            }
             if (lastMsg) {
               lastMsg.message.usage = usage
               lastMsg.message.stop_reason = stopReason
 
-              const responseItems = (
-                partialMessage as unknown as Record<string, unknown>
-              )._openai_response_items
               if (Array.isArray(responseItems)) {
                 for (const message of newMessages) {
                   ;(
@@ -2311,6 +2346,7 @@ async function* queryModel(
                 )._openai_response_items = responseItems
               }
             }
+            if (metadataOnlyMessage) yield metadataOnlyMessage
 
             // Update cost
             const costUSDForPart = calculateUSDCost(resolvedModel, usage)

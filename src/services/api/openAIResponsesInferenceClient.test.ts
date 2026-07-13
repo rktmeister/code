@@ -224,6 +224,37 @@ describe('OpenAIResponsesInferenceClient', () => {
     ])
   })
 
+  it('distinguishes content filtering from output-token exhaustion', async () => {
+    const responses = [
+      {
+        id: 'resp-filtered',
+        model: 'gpt-test',
+        status: 'incomplete',
+        incomplete_details: { reason: 'content_filter' },
+        output: [],
+      },
+      {
+        id: 'resp-limited',
+        model: 'gpt-test',
+        status: 'incomplete',
+        incomplete_details: { reason: 'max_output_tokens' },
+        output: [],
+      },
+    ]
+    const client = new OpenAIResponsesInferenceClient({
+      baseURL: 'https://proxy.example.test/v1',
+      fetch: async () => Response.json(responses.shift()),
+    })
+    const params = {
+      model: 'gpt-test',
+      max_tokens: 10,
+      messages: [{ role: 'user', content: 'request' }],
+    } as const
+
+    expect((await client.createMessage(params)).stop_reason).toBe('refusal')
+    expect((await client.createMessage(params)).stop_reason).toBe('max_tokens')
+  })
+
   it('forwards an already-aborted request signal', async () => {
     const abortController = new AbortController()
     abortController.abort(new Error('cancelled'))
@@ -322,6 +353,105 @@ describe('OpenAIResponsesInferenceClient', () => {
     )
   })
 
+  it('does not release a truncated function call for execution', async () => {
+    const frames = [
+      { type: 'response.created', response: { id: 'resp-1', model: 'gpt-test' } },
+      {
+        type: 'response.output_item.added',
+        output_index: 0,
+        item: {
+          type: 'function_call',
+          id: 'fc-1',
+          call_id: 'call-1',
+          name: 'Write',
+          arguments: '',
+        },
+      },
+      {
+        type: 'response.function_call_arguments.delta',
+        output_index: 0,
+        delta: '{"file_path":"a.ts"}',
+      },
+      {
+        type: 'response.output_item.done',
+        output_index: 0,
+        item: {
+          type: 'function_call',
+          id: 'fc-1',
+          call_id: 'call-1',
+          name: 'Write',
+          arguments: '{"file_path":"a.ts"}',
+        },
+      },
+    ]
+      .map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+      .join('')
+    const client = new OpenAIResponsesInferenceClient({
+      baseURL: 'https://proxy.example.test/v1',
+      fetch: async () => new Response(frames),
+    })
+    const stream = await client.createMessage({
+      model: 'gpt-test',
+      max_tokens: 10,
+      messages: [{ role: 'user', content: 'request' }],
+      stream: true,
+    })
+
+    const events = []
+    let thrown: unknown
+    try {
+      for await (const event of stream) events.push(event)
+    } catch (error) {
+      thrown = error
+    }
+    expect(thrown).toBeInstanceOf(Error)
+    expect(events).not.toContainEqual(
+      expect.objectContaining({ type: 'content_block_stop' }),
+    )
+  })
+
+  it('retains opaque items for a response with no visible content', async () => {
+    const output = [
+      { type: 'reasoning', id: 'r1', encrypted_content: 'opaque', summary: [] },
+    ]
+    const frames = [
+      { type: 'response.created', response: { id: 'resp-1', model: 'gpt-test' } },
+      {
+        type: 'response.completed',
+        response: {
+          id: 'resp-1',
+          model: 'gpt-test',
+          status: 'completed',
+          output,
+          usage: { input_tokens: 5, output_tokens: 2 },
+        },
+      },
+    ]
+      .map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+      .join('')
+    const client = new OpenAIResponsesInferenceClient({
+      baseURL: 'https://proxy.example.test/v1',
+      fetch: async () => new Response(frames),
+    })
+    const stream = await client.createMessage({
+      model: 'gpt-test',
+      max_tokens: 10,
+      messages: [{ role: 'user', content: 'request' }],
+      stream: true,
+    })
+
+    const events = []
+    for await (const event of stream) events.push(event)
+    const start = events[0] as unknown as { message: Record<string, unknown> }
+    expect(start.message._openai_response_items).toEqual(output)
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'message_delta',
+        delta: expect.objectContaining({ stop_reason: 'end_turn' }),
+      }),
+    )
+  })
+
   it('streams refusal text with a refusal stop reason', async () => {
     const output = [
       {
@@ -365,12 +495,58 @@ describe('OpenAIResponsesInferenceClient', () => {
     )
   })
 
-  it('uses the standalone compact endpoint and returns its canonical output', async () => {
-    let url = ''
+  it('maps a streamed content filter to refusal instead of max tokens', async () => {
+    const frames = [
+      { type: 'response.created', response: { id: 'resp-1', model: 'gpt-test' } },
+      {
+        type: 'response.incomplete',
+        response: {
+          id: 'resp-1',
+          model: 'gpt-test',
+          status: 'incomplete',
+          incomplete_details: { reason: 'content_filter' },
+          output: [],
+          usage: { input_tokens: 5, output_tokens: 0 },
+        },
+      },
+    ]
+      .map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+      .join('')
     const client = new OpenAIResponsesInferenceClient({
       baseURL: 'https://proxy.example.test/v1',
-      fetch: async input => {
+      fetch: async () => new Response(frames),
+    })
+    const stream = await client.createMessage({
+      model: 'gpt-test',
+      max_tokens: 10,
+      messages: [{ role: 'user', content: 'request' }],
+      stream: true,
+    })
+
+    const events = []
+    for await (const event of stream) events.push(event)
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'message_delta',
+        delta: expect.objectContaining({ stop_reason: 'refusal' }),
+      }),
+    )
+    expect(events).not.toContainEqual(
+      expect.objectContaining({
+        type: 'message_delta',
+        delta: expect.objectContaining({ stop_reason: 'max_tokens' }),
+      }),
+    )
+  })
+
+  it('uses the standalone compact endpoint and returns its canonical output', async () => {
+    let url = ''
+    let body: Record<string, unknown> = {}
+    const client = new OpenAIResponsesInferenceClient({
+      baseURL: 'https://proxy.example.test/v1',
+      fetch: async (input, init) => {
         url = String(input)
+        body = JSON.parse(String(init?.body))
         return Response.json({
           object: 'response.compaction',
           output: [{ type: 'compaction', encrypted_content: 'opaque' }],
@@ -381,9 +557,25 @@ describe('OpenAIResponsesInferenceClient', () => {
     const compacted = await client.compactResponse({
       model: 'gpt-test',
       max_tokens: 100,
+      system: [{ type: 'text', text: 'system' }],
       messages: [{ role: 'user', content: 'history' }],
+      tools: [
+        {
+          name: 'Read',
+          description: 'Read a file',
+          input_schema: { type: 'object', properties: {} },
+        },
+      ],
+      tool_choice: { type: 'auto', disable_parallel_tool_use: true },
+      thinking: { type: 'enabled', budget_tokens: 1000 },
+      output_config: { effort: 'high' },
     })
     expect(url).toBe('https://proxy.example.test/v1/responses/compact')
+    expect(body).toEqual({
+      model: 'gpt-test',
+      input: [{ type: 'message', role: 'user', content: 'history' }],
+      instructions: 'system',
+    })
     expect(compacted.output).toEqual([
       { type: 'compaction', encrypted_content: 'opaque' },
     ])
