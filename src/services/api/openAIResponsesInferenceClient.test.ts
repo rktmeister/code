@@ -1,8 +1,13 @@
 import { describe, expect, it } from 'bun:test'
 import {
   buildOpenAIResponsesRequest,
+  createOpenAIResponsesStateScope,
   OpenAIResponsesInferenceClient,
 } from './openAIResponsesInferenceClient.js'
+import {
+  isOpenAIResponsesRetryableError,
+  OpenAIResponsesResponseError,
+} from './openAICompatInferenceClient.js'
 
 describe('OpenAIResponsesInferenceClient', () => {
   it('maps Anthropic-shaped tools and messages to Responses items', () => {
@@ -119,6 +124,10 @@ describe('OpenAIResponsesInferenceClient', () => {
   })
 
   it('records locally loaded tools as client tool-search items', async () => {
+    const scope = createOpenAIResponsesStateScope(
+      'https://proxy.example.test/v1/responses',
+      'gpt-5.4',
+    )
     const output = [
       {
         type: 'function_call',
@@ -190,7 +199,7 @@ describe('OpenAIResponsesInferenceClient', () => {
           },
         },
       ],
-    } as never)
+    } as never, scope)
 
     expect(nextRequest.input).toEqual([
       ...output,
@@ -237,6 +246,11 @@ describe('OpenAIResponsesInferenceClient', () => {
   })
 
   it('replays native output items without translating them', () => {
+    const scope = createOpenAIResponsesStateScope(
+      'https://proxy.example.test/v1/responses',
+      'gpt-5.4',
+      { Authorization: 'Bearer test' },
+    )
     const items = [
       { type: 'reasoning', id: 'r1', encrypted_content: 'opaque' },
       {
@@ -280,13 +294,17 @@ describe('OpenAIResponsesInferenceClient', () => {
       messages: Array.from({ length: 4 }, () => ({
         role: 'assistant',
         content: [],
-        _openai_response_items: items,
+        _openai_response_state: { version: 1, scope, items },
       })),
-    } as never)
+    } as never, scope)
     expect(request.input).toEqual(items)
   })
 
   it('does not replay tool-search items to an unsupported Responses model', () => {
+    const scope = createOpenAIResponsesStateScope(
+      'https://proxy.example.test/v1/responses',
+      'gpt-5.3',
+    )
     const request = buildOpenAIResponsesRequest({
       model: 'gpt-5.3',
       max_tokens: 10,
@@ -294,19 +312,23 @@ describe('OpenAIResponsesInferenceClient', () => {
         {
           role: 'assistant',
           content: [],
-          _openai_response_items: [
-            { type: 'reasoning', id: 'r1', encrypted_content: 'opaque' },
-            { type: 'tool_search_call', call_id: 'ts1', arguments: {} },
-            { type: 'tool_search_output', call_id: 'ts1', tools: [] },
-            {
-              type: 'message',
-              role: 'assistant',
-              content: [{ type: 'output_text', text: 'done' }],
-            },
-          ],
+          _openai_response_state: {
+            version: 1,
+            scope,
+            items: [
+              { type: 'reasoning', id: 'r1', encrypted_content: 'opaque' },
+              { type: 'tool_search_call', call_id: 'ts1', arguments: {} },
+              { type: 'tool_search_output', call_id: 'ts1', tools: [] },
+              {
+                type: 'message',
+                role: 'assistant',
+                content: [{ type: 'output_text', text: 'done' }],
+              },
+            ],
+          },
         },
       ],
-    } as never)
+    } as never, scope)
 
     expect(request.input).toEqual([
       { type: 'reasoning', id: 'r1', encrypted_content: 'opaque' },
@@ -314,6 +336,72 @@ describe('OpenAIResponsesInferenceClient', () => {
         type: 'message',
         role: 'assistant',
         content: [{ type: 'output_text', text: 'done' }],
+      },
+    ])
+  })
+
+  it('replays opaque state only for the endpoint, model, and credentials that created it', () => {
+    const endpoint = 'https://proxy.example.test/v1/responses'
+    const originalScope = createOpenAIResponsesStateScope(
+      endpoint,
+      'gpt-test',
+      { Authorization: 'Bearer original-secret' },
+    )
+    const changedCredentialScope = createOpenAIResponsesStateScope(
+      endpoint,
+      'gpt-test',
+      { Authorization: 'Bearer replacement-secret' },
+    )
+    const changedModelScope = createOpenAIResponsesStateScope(
+      endpoint,
+      'gpt-other',
+      { Authorization: 'Bearer original-secret' },
+    )
+    const changedEndpointScope = createOpenAIResponsesStateScope(
+      'https://other.example.test/v1/responses',
+      'gpt-test',
+      { Authorization: 'Bearer original-secret' },
+    )
+
+    expect(new Set([
+      originalScope,
+      changedCredentialScope,
+      changedModelScope,
+      changedEndpointScope,
+    ]).size).toBe(4)
+    expect(originalScope).not.toContain('original-secret')
+
+    const request = buildOpenAIResponsesRequest({
+      model: 'gpt-test',
+      max_tokens: 10,
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'Reasoning summary. ', signature: '' },
+            { type: 'text', text: 'Visible answer.' },
+            { type: 'tool_use', id: 'call-1', name: 'Read', input: { path: 'a.ts' } },
+          ],
+          _openai_response_state: {
+            version: 1,
+            scope: originalScope,
+            items: [{ type: 'reasoning', id: 'r1', encrypted_content: 'opaque' }],
+          },
+        },
+      ],
+    } as never, changedCredentialScope)
+
+    expect(request.input).toEqual([
+      {
+        type: 'message',
+        role: 'assistant',
+        content: 'Reasoning summary. Visible answer.',
+      },
+      {
+        type: 'function_call',
+        call_id: 'call-1',
+        name: 'Read',
+        arguments: '{"path":"a.ts"}',
       },
     ])
   })
@@ -467,10 +555,15 @@ describe('OpenAIResponsesInferenceClient', () => {
     expect(body).toMatchObject({ store: false, include: ['reasoning.encrypted_content'] })
     expect(result.content[0]).toMatchObject({ type: 'tool_use', id: 'call-1', name: 'Read' })
     expect(result.usage).toMatchObject({ input_tokens: 40, cache_read_input_tokens: 60, output_tokens: 10 })
-    expect((result as unknown as Record<string, unknown>)._openai_response_items).toHaveLength(1)
+    expect(
+      (
+        (result as unknown as Record<string, unknown>)
+          ._openai_response_state as { items: unknown[] }
+      ).items,
+    ).toHaveLength(1)
   })
 
-  it('rejects failed and cancelled unary responses', async () => {
+  it('classifies terminal unary response errors without treating them as transport failures', async () => {
     const responses = [
       {
         id: 'resp-failed',
@@ -480,6 +573,17 @@ describe('OpenAIResponsesInferenceClient', () => {
           code: 'server_error',
           type: 'server_error',
           message: 'Upstream inference failed',
+        },
+        output: [],
+      },
+      {
+        id: 'resp-invalid',
+        model: 'gpt-test',
+        status: 'failed',
+        error: {
+          code: 'invalid_prompt',
+          type: 'invalid_request_error',
+          message: 'Prompt is invalid',
         },
         output: [],
       },
@@ -501,12 +605,17 @@ describe('OpenAIResponsesInferenceClient', () => {
       messages: [{ role: 'user', content: 'request' }],
     } as const
 
-    expect(client.createMessage(params)).rejects.toThrow(
-      'server_error: Upstream inference failed',
-    )
-    expect(client.createMessage(params)).rejects.toThrow(
-      'Responses API response was cancelled: cancelled: Request was cancelled',
-    )
+    const serverError = await client.createMessage(params).catch(error => error)
+    expect(serverError).toBeInstanceOf(OpenAIResponsesResponseError)
+    expect(isOpenAIResponsesRetryableError(serverError)).toBe(true)
+
+    const invalidPrompt = await client.createMessage(params).catch(error => error)
+    expect(invalidPrompt).toBeInstanceOf(OpenAIResponsesResponseError)
+    expect(isOpenAIResponsesRetryableError(invalidPrompt)).toBe(false)
+
+    const cancelled = await client.createMessage(params).catch(error => error)
+    expect(cancelled).toBeInstanceOf(OpenAIResponsesResponseError)
+    expect(isOpenAIResponsesRetryableError(cancelled)).toBe(false)
   })
 
   it('maps unary refusals to the downstream refusal contract', async () => {
@@ -626,7 +735,9 @@ describe('OpenAIResponsesInferenceClient', () => {
       content_block: expect.objectContaining({ type: 'tool_use', id: 'call-1', name: 'Read' }),
     }))
     const start = events[0] as unknown as { message: Record<string, unknown> }
-    expect(start.message._openai_response_items).toEqual(output)
+    expect(
+      (start.message._openai_response_state as { items: unknown[] }).items,
+    ).toEqual(output)
     expect(start.message.usage).toMatchObject({
       input_tokens: 12,
       output_tokens: 3,
@@ -684,6 +795,48 @@ describe('OpenAIResponsesInferenceClient', () => {
     expect((thrown as Error).message).toContain(
       'ended before a terminal response event',
     )
+  })
+
+  it('surfaces terminal stream failures as semantic Responses errors', async () => {
+    const failed = {
+      type: 'response.failed',
+      response: {
+        id: 'response-failed',
+        model: 'gpt-test',
+        status: 'failed',
+        error: {
+          code: 'invalid_prompt',
+          type: 'invalid_request_error',
+          message: 'Prompt is invalid',
+        },
+        output: [],
+      },
+    }
+    const client = new OpenAIResponsesInferenceClient({
+      baseURL: 'https://proxy.example.test/v1',
+      fetch: async () =>
+        new Response(
+          `event: response.failed\ndata: ${JSON.stringify(failed)}\n\n`,
+        ),
+    })
+    const stream = await client.createMessage({
+      model: 'gpt-test',
+      max_tokens: 10,
+      messages: [{ role: 'user', content: 'request' }],
+      stream: true,
+    })
+
+    let thrown: unknown
+    try {
+      for await (const _event of stream) {
+        // Consume the stream to its terminal validation.
+      }
+    } catch (error) {
+      thrown = error
+    }
+
+    expect(thrown).toBeInstanceOf(OpenAIResponsesResponseError)
+    expect(isOpenAIResponsesRetryableError(thrown)).toBe(false)
   })
 
   it('does not release a truncated function call for execution', async () => {
@@ -776,7 +929,9 @@ describe('OpenAIResponsesInferenceClient', () => {
     const events = []
     for await (const event of stream) events.push(event)
     const start = events[0] as unknown as { message: Record<string, unknown> }
-    expect(start.message._openai_response_items).toEqual(output)
+    expect(
+      (start.message._openai_response_state as { items: unknown[] }).items,
+    ).toEqual(output)
     expect(events).toContainEqual(
       expect.objectContaining({
         type: 'message_delta',

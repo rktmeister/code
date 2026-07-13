@@ -60,10 +60,10 @@ class AnthropicInferenceClient implements InferenceClient {
       const rawMessage = message as Record<string, unknown>
       const hasResponsesMetadata = Object.hasOwn(
         rawMessage,
-        '_openai_response_items',
+        '_openai_response_state',
       )
       const {
-        _openai_response_items: _ignored,
+        _openai_response_state: _ignored,
         ...anthropicMessage
       } = rawMessage
       if (!hasResponsesMetadata || !Array.isArray(rawMessage.content)) {

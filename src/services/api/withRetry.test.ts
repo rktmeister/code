@@ -33,6 +33,7 @@ import {
   OpenAICompatBackendAbortError,
   OpenAICompatHTTPError,
   OpenAICompatTransportError,
+  OpenAIResponsesResponseError,
 } from './openAICompatInferenceClient.js'
 
 let tempConfigDir = ''
@@ -533,6 +534,63 @@ describe('withRetry', () => {
     }
     expect(caught).toBeInstanceOf(CannotRetryError)
     expect((caught as CannotRetryError).originalError).toBe(quotaError)
+    expect(attempts).toBe(1)
+  })
+
+  it('retries transient terminal Responses errors', async () => {
+    let attempts = 0
+    const iterator = withRetry(
+      async () => ({}) as Anthropic,
+      async () => {
+        attempts++
+        if (attempts === 1) {
+          throw new OpenAIResponsesResponseError(
+            'server_error',
+            'server_error',
+            'Upstream inference failed',
+          )
+        }
+        return 'ok'
+      },
+      {
+        maxRetries: 1,
+        model: 'gpt-test',
+        thinkingConfig: { type: 'adaptive' } satisfies ThinkingConfig,
+      },
+    )
+
+    expect(await iterator.next()).toEqual({ done: true, value: 'ok' })
+    expect(attempts).toBe(2)
+  })
+
+  it('does not retry terminal Responses request errors', async () => {
+    let attempts = 0
+    const responseError = new OpenAIResponsesResponseError(
+      'invalid_prompt',
+      'invalid_request_error',
+      'Prompt is invalid',
+    )
+    const iterator = withRetry(
+      async () => ({}) as Anthropic,
+      async () => {
+        attempts++
+        throw responseError
+      },
+      {
+        maxRetries: 2,
+        model: 'gpt-test',
+        thinkingConfig: { type: 'adaptive' } satisfies ThinkingConfig,
+      },
+    )
+
+    let caught: unknown
+    try {
+      await iterator.next()
+    } catch (error) {
+      caught = error
+    }
+    expect(caught).toBeInstanceOf(CannotRetryError)
+    expect((caught as CannotRetryError).originalError).toBe(responseError)
     expect(attempts).toBe(1)
   })
 

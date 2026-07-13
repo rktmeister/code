@@ -18,14 +18,20 @@ import type {
   InferenceListModelsResult,
 } from './inferenceClient.js'
 import {
-  OpenAICompatHTTPError,
+  createOpenAICompatHTTPError,
   OpenAICompatTransportError,
+  OpenAIResponsesResponseError,
 } from './openAICompatInferenceClient.js'
 
-export const OPENAI_RESPONSE_ITEMS_FIELD = '_openai_response_items'
+export const OPENAI_RESPONSE_STATE_FIELD = '_openai_response_state'
 
 type FetchLike = typeof fetch
 type ResponseItem = Record<string, unknown> & { type: string }
+export type OpenAIResponseState = {
+  version: 1
+  scope: string
+  items: ResponseItem[]
+}
 type ResponseUsage = {
   input_tokens?: number
   output_tokens?: number
@@ -82,16 +88,69 @@ function systemText(system: unknown): string | undefined {
   return text || undefined
 }
 
-function contentText(content: unknown): string {
+function contentText(content: unknown, includeThinking = false): string {
   if (typeof content === 'string') return content
   if (!Array.isArray(content)) return String(content ?? '')
   return content
     .map(block => {
       if (!block || typeof block !== 'object') return ''
       if ('text' in block && typeof block.text === 'string') return block.text
+      if (
+        includeThinking &&
+        'thinking' in block &&
+        typeof block.thinking === 'string'
+      ) {
+        return block.thinking
+      }
       return ''
     })
     .join('')
+}
+
+function responseState(value: unknown): OpenAIResponseState | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  const state = value as Record<string, unknown>
+  if (
+    state.version !== 1 ||
+    typeof state.scope !== 'string' ||
+    !Array.isArray(state.items)
+  ) {
+    return undefined
+  }
+  return state as OpenAIResponseState
+}
+
+export function createOpenAIResponsesStateScope(
+  endpoint: string,
+  model: string,
+  headers?: HeadersInit,
+): string {
+  const url = new URL(endpoint)
+  url.username = ''
+  url.password = ''
+  url.hash = ''
+  const identityHeaders = new Headers(headers)
+  const identity = [
+    'authorization',
+    'x-api-key',
+    'api-key',
+    'openai-organization',
+    'openai-project',
+  ].flatMap(name => {
+    const value = identityHeaders.get(name)
+    return value === null ? [] : [[name, value]]
+  })
+  return createHash('sha256')
+    .update(
+      JSON.stringify({
+        version: 1,
+        api: 'responses',
+        endpoint: url.toString(),
+        model,
+        identity,
+      }),
+    )
+    .digest('hex')
 }
 
 function responseItemKey(item: ResponseItem): string {
@@ -300,6 +359,7 @@ function convertMessages(
   messages: unknown,
   tools: unknown,
   model: string,
+  stateScope?: string,
 ): ResponseItem[] {
   if (!Array.isArray(messages)) {
     throw new Error('Inference messages must be an array')
@@ -311,9 +371,18 @@ function convertMessages(
   const supportsToolSearch = modelSupportsOpenAIResponsesToolSearch(model)
   for (const message of messages) {
     if (!message || typeof message !== 'object' || !('role' in message)) continue
-    const raw = (message as Record<string, unknown>)[OPENAI_RESPONSE_ITEMS_FIELD]
-    if (Array.isArray(raw)) {
-      for (const item of raw as ResponseItem[]) {
+    const rawState = (message as Record<string, unknown>)[
+      OPENAI_RESPONSE_STATE_FIELD
+    ]
+    const state = responseState(rawState)
+    const stateMatches =
+      stateScope !== undefined && state?.scope === stateScope
+    if (
+      stateScope !== undefined &&
+      state?.scope === stateScope &&
+      state.items.length > 0
+    ) {
+      for (const item of state.items) {
         if (
           !supportsToolSearch &&
           (item.type === 'tool_search_call' ||
@@ -392,7 +461,7 @@ function convertMessages(
       continue
     }
     if (role === 'assistant' && Array.isArray(content)) {
-      const text = contentText(content)
+      const text = contentText(content, rawState !== undefined && !stateMatches)
       if (text) input.push({ type: 'message', role: 'assistant', content: text })
       for (const block of content) {
         if (block && typeof block === 'object' && block.type === 'tool_use') {
@@ -484,6 +553,7 @@ function convertTools(tools: unknown): ResponseItem[] | undefined {
 
 export function buildOpenAIResponsesRequest(
   params: InferenceCreateMessageArgs[0],
+  stateScope?: string,
 ) {
   const reasoning =
     params.thinking?.type === 'disabled'
@@ -500,7 +570,12 @@ export function buildOpenAIResponsesRequest(
   const parallelToolCalls = convertParallelToolCalls(params.tool_choice)
   return {
     model: params.model,
-    input: convertMessages(params.messages, params.tools, params.model),
+    input: convertMessages(
+      params.messages,
+      params.tools,
+      params.model,
+      stateScope,
+    ),
     ...(systemText(params.system)
       ? { instructions: systemText(params.system) }
       : {}),
@@ -536,29 +611,27 @@ function incompleteStopReason(
   }
 }
 
-function responseStatusDetail(response: OpenAIResponse): string {
-  const code = response.error?.code?.trim()
-  const type = response.error?.type?.trim()
-  const message = response.error?.message?.replace(/\s+/g, ' ').trim()
-  const label = [...new Set([code, type].filter(Boolean))].join('/')
-  return [label, message].filter(Boolean).join(': ').slice(0, 1000)
+function responseErrorDetail(response: OpenAIResponse): string | undefined {
+  return response.error?.message?.replace(/\s+/g, ' ').trim().slice(0, 1000)
+}
+
+function terminalResponseError(response: OpenAIResponse) {
+  return new OpenAIResponsesResponseError(
+    response.error?.code ?? response.status,
+    response.error?.type,
+    responseErrorDetail(response),
+  )
 }
 
 function assertTerminalResponse(response: OpenAIResponse): void {
   if (response.status === 'completed' || response.status === 'incomplete') {
     return
   }
-  const detail = responseStatusDetail(response)
   if (response.status === 'failed') {
-    throw new OpenAICompatTransportError(
-      `Responses API response failed${detail ? `: ${detail}` : ''}`,
-      response.error,
-    )
+    throw terminalResponseError(response)
   }
   if (response.status === 'cancelled') {
-    throw new Error(
-      `Responses API response was cancelled${detail ? `: ${detail}` : ''}`,
-    )
+    throw terminalResponseError(response)
   }
   throw new OpenAICompatTransportError(
     `Responses API returned non-terminal status: ${String(response.status)}`,
@@ -577,7 +650,10 @@ function refusalText(response: OpenAIResponse): string {
     .join('')
 }
 
-function messageFromResponse(response: OpenAIResponse): BetaMessage {
+function messageFromResponse(
+  response: OpenAIResponse,
+  stateScope: string,
+): BetaMessage {
   assertTerminalResponse(response)
   const content: Array<Record<string, unknown>> = []
   const refusal = refusalText(response)
@@ -618,7 +694,11 @@ function messageFromResponse(response: OpenAIResponse): BetaMessage {
       : (incompleteReason ?? 'end_turn'),
     stop_sequence: null,
     usage: usage(response.usage),
-    [OPENAI_RESPONSE_ITEMS_FIELD]: response.output ?? [],
+    [OPENAI_RESPONSE_STATE_FIELD]: {
+      version: 1,
+      scope: stateScope,
+      items: response.output ?? [],
+    } satisfies OpenAIResponseState,
   } as unknown as BetaMessage
 }
 
@@ -626,6 +706,7 @@ async function* streamEvents(
   response: Response,
   fallbackModel: string,
   controller: AbortController,
+  stateScope: string,
 ): AsyncGenerator<BetaRawMessageStreamEvent> {
   if (!response.body) throw new Error('Responses stream body missing')
   const reader = response.body.getReader()
@@ -653,7 +734,11 @@ async function* streamEvents(
       stop_reason: null,
       stop_sequence: null,
       usage: finalUsage,
-      [OPENAI_RESPONSE_ITEMS_FIELD]: items,
+      [OPENAI_RESPONSE_STATE_FIELD]: {
+        version: 1,
+        scope: stateScope,
+        items,
+      } satisfies OpenAIResponseState,
     },
   } as unknown as BetaRawMessageStreamEvent
 
@@ -788,9 +873,16 @@ async function* streamEvents(
           break streamLoop
         } else if (type === 'error') {
           terminalReceived = true
-          throw new OpenAICompatTransportError(
-            `Responses API stream failed: ${JSON.stringify(event.error ?? event)}`,
-            event.error,
+          const streamError =
+            event.error && typeof event.error === 'object'
+              ? (event.error as Record<string, unknown>)
+              : event
+          throw new OpenAIResponsesResponseError(
+            typeof streamError.code === 'string' ? streamError.code : undefined,
+            typeof streamError.type === 'string' ? streamError.type : undefined,
+            typeof streamError.message === 'string'
+              ? streamError.message.replace(/\s+/g, ' ').trim().slice(0, 1000)
+              : undefined,
           )
         }
       }
@@ -845,33 +937,6 @@ function operation<T>(
   })
 }
 
-async function responseError(response: Response): Promise<OpenAICompatHTTPError> {
-  let detail: string | undefined
-  let errorCode: string | undefined
-  let errorType: string | undefined
-  try {
-    const body = (await response.json()) as Record<string, unknown>
-    const nested =
-      body.error && typeof body.error === 'object'
-        ? (body.error as Record<string, unknown>)
-        : undefined
-    const candidate = nested?.message ?? body.message ?? body.detail
-    if (typeof candidate === 'string' && candidate.trim()) {
-      detail = candidate.replace(/\s+/g, ' ').trim().slice(0, 1000)
-    }
-    if (typeof nested?.code === 'string') errorCode = nested.code
-    if (typeof nested?.type === 'string') errorType = nested.type
-  } catch {
-    // Non-JSON error pages do not contain safe, structured API diagnostics.
-  }
-  return new OpenAICompatHTTPError(
-    response.status,
-    response.statusText,
-    detail,
-    { headers: response.headers, errorCode, errorType },
-  )
-}
-
 export class OpenAIResponsesInferenceClient implements InferenceClient {
   private readonly fetchImpl: FetchLike
   constructor(private readonly options: Options) {
@@ -916,8 +981,21 @@ export class OpenAIResponsesInferenceClient implements InferenceClient {
     })
   }
 
+  private stateScope(model: string, extra?: HeadersInit): string {
+    const headers = new Headers(this.options.headers)
+    for (const [key, value] of new Headers(extra).entries()) {
+      headers.set(key, value)
+    }
+    return createOpenAIResponsesStateScope(
+      this.url('/v1/responses'),
+      model,
+      headers,
+    )
+  }
+
   createMessage(...args: InferenceCreateMessageArgs): InferenceCreateMessageResult {
     const [params, options] = args
+    const stateScope = this.stateScope(params.model, options?.headers)
     const controller = new AbortController()
     if (options?.signal?.aborted) {
       controller.abort(options.signal.reason)
@@ -930,24 +1008,25 @@ export class OpenAIResponsesInferenceClient implements InferenceClient {
     }
     const responsePromise = this.request(
       '/v1/responses',
-      buildOpenAIResponsesRequest(params),
+      buildOpenAIResponsesRequest(params, stateScope),
       controller.signal,
       options?.headers,
     )
     return operation(responsePromise, async response => {
-      if (!response.ok) throw await responseError(response)
-      if (params.stream) return new SDKStream(() => streamEvents(response, params.model, controller), controller) as never
-      return messageFromResponse((await response.json()) as OpenAIResponse) as never
+      if (!response.ok) throw await createOpenAICompatHTTPError(response)
+      if (params.stream) return new SDKStream(() => streamEvents(response, params.model, controller, stateScope), controller) as never
+      return messageFromResponse((await response.json()) as OpenAIResponse, stateScope) as never
     }) as InferenceCreateMessageResult
   }
 
   countTokens(...args: InferenceCountTokensArgs): InferenceCountTokensResult {
     const [params, options] = args
+    const stateScope = this.stateScope(params.model, options?.headers)
     const createRequest = buildOpenAIResponsesRequest({
       ...params,
       max_tokens: 1,
       stream: false,
-    } as InferenceCreateMessageArgs[0])
+    } as InferenceCreateMessageArgs[0], stateScope)
     const {
       include: _include,
       max_output_tokens: _maxOutputTokens,
@@ -961,7 +1040,7 @@ export class OpenAIResponsesInferenceClient implements InferenceClient {
       options?.headers,
     ).then(async response => {
       if (!response.ok) {
-        throw await responseError(response)
+        throw await createOpenAICompatHTTPError(response)
       }
       const body = (await response.json()) as { input_tokens?: number }
       if (typeof body.input_tokens !== 'number') {
@@ -978,6 +1057,6 @@ export class OpenAIResponsesInferenceClient implements InferenceClient {
     const headers = new Headers(this.options.headers)
     for (const [key, value] of new Headers(options?.headers).entries()) headers.set(key, value)
     const promise = this.fetchImpl(this.url('/v1/models'), { headers, signal: options?.signal })
-    return { async *[Symbol.asyncIterator]() { const response = await promise; if (!response.ok) throw await responseError(response); const body = await response.json() as { data?: Array<Record<string, unknown>> }; for (const item of body.data ?? []) yield item } } as InferenceListModelsResult
+    return { async *[Symbol.asyncIterator]() { const response = await promise; if (!response.ok) throw await createOpenAICompatHTTPError(response); const body = await response.json() as { data?: Array<Record<string, unknown>> }; for (const item of body.data ?? []) yield item } } as InferenceListModelsResult
   }
 }

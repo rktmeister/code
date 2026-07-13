@@ -135,7 +135,11 @@ describe('Responses tool-search message normalization', () => {
         message: {
           ...assistantMessage,
           content: [{ type: 'text', text: 'Searching.' }],
-          _openai_response_items: [],
+          _openai_response_state: {
+            version: 1,
+            scope: 'test-scope',
+            items: [],
+          },
         },
       },
       {
@@ -152,7 +156,11 @@ describe('Responses tool-search message normalization', () => {
               input: { query: 'repository' },
             },
           ],
-          _openai_response_items: responseItems,
+          _openai_response_state: {
+            version: 1,
+            scope: 'test-scope',
+            items: responseItems,
+          },
         },
       },
     ] as never)
@@ -161,8 +169,8 @@ describe('Responses tool-search message normalization', () => {
     expect(
       (
         normalized[0]!.message as unknown as Record<string, unknown>
-      )._openai_response_items,
-    ).toEqual(responseItems)
+      )._openai_response_state,
+    ).toEqual({ version: 1, scope: 'test-scope', items: responseItems })
   })
 
   it('keeps opaque state on a reasoning-only Responses message', () => {
@@ -190,7 +198,11 @@ describe('Responses tool-search message normalization', () => {
           content: [
             { type: 'thinking', thinking: 'Summary', signature: '' },
           ],
-          _openai_response_items: responseItems,
+          _openai_response_state: {
+            version: 1,
+            scope: 'test-scope',
+            items: responseItems,
+          },
         },
       },
     ] as never)
@@ -198,8 +210,8 @@ describe('Responses tool-search message normalization', () => {
     expect(normalized).toHaveLength(1)
     expect(
       (normalized[0]!.message as unknown as Record<string, unknown>)
-        ._openai_response_items,
-    ).toEqual(responseItems)
+        ._openai_response_state,
+    ).toEqual({ version: 1, scope: 'test-scope', items: responseItems })
   })
 
   it('converts Responses reasoning summaries to text for Anthropic', () => {
@@ -222,9 +234,13 @@ describe('Responses tool-search message normalization', () => {
             { type: 'thinking', thinking: 'Reasoning summary', signature: '' },
             { type: 'text', text: 'Visible answer' },
           ],
-          _openai_response_items: [
-            { type: 'reasoning', id: 'reasoning-1', encrypted_content: 'opaque' },
-          ],
+          _openai_response_state: {
+            version: 1,
+            scope: 'test-scope',
+            items: [
+              { type: 'reasoning', id: 'reasoning-1', encrypted_content: 'opaque' },
+            ],
+          },
         },
       },
     ] as never)
@@ -236,7 +252,7 @@ describe('Responses tool-search message normalization', () => {
     ])
     expect(
       (normalized[0]!.message as unknown as Record<string, unknown>)
-        ._openai_response_items,
+        ._openai_response_state,
     ).toBeUndefined()
   })
 })

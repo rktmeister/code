@@ -321,9 +321,13 @@ describe('getInferenceClient', () => {
             { type: 'thinking', thinking: 'Reasoning summary', signature: '' },
             { type: 'text', text: 'Visible answer' },
           ],
-          _openai_response_items: [
-            { type: 'reasoning', id: 'reasoning-1', encrypted_content: 'opaque' },
-          ],
+          _openai_response_state: {
+            version: 1,
+            scope: 'test-scope',
+            items: [
+              { type: 'reasoning', id: 'reasoning-1', encrypted_content: 'opaque' },
+            ],
+          },
         },
         { role: 'user', content: 'Continue' },
       ],

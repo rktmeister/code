@@ -103,6 +103,7 @@ import {
   getCurrentOauthBackedInferenceAccountUuid,
   getCurrentOauthBackedFirstPartyInferenceSession,
 } from './firstPartyInferenceSession.js'
+import { isOpenAIResponsesResponseError } from './openAICompatInferenceClient.js'
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const autoModeStateModule = feature('TRANSCRIPT_CLASSIFIER')
@@ -619,9 +620,11 @@ export function userMessageToMessageParam(
   enablePromptCaching: boolean,
   querySource?: QuerySource,
 ): MessageParam {
-  const responseItems = (
+  const responseState = (
     message.message as unknown as Record<string, unknown>
-  )._openai_response_items
+  )._openai_response_state
+  const hasResponseState =
+    !!responseState && typeof responseState === 'object'
   if (addCache) {
     if (typeof message.message.content === 'string') {
       return {
@@ -635,8 +638,8 @@ export function userMessageToMessageParam(
             }),
           },
         ],
-        ...(Array.isArray(responseItems)
-          ? { _openai_response_items: responseItems }
+        ...(hasResponseState
+          ? { _openai_response_state: responseState }
           : {}),
       } as MessageParam
     } else {
@@ -650,8 +653,8 @@ export function userMessageToMessageParam(
               : {}
             : {}),
         })),
-        ...(Array.isArray(responseItems)
-          ? { _openai_response_items: responseItems }
+        ...(hasResponseState
+          ? { _openai_response_state: responseState }
           : {}),
       } as MessageParam
     }
@@ -664,8 +667,8 @@ export function userMessageToMessageParam(
     content: Array.isArray(message.message.content)
       ? [...message.message.content]
       : message.message.content,
-    ...(Array.isArray(responseItems)
-      ? { _openai_response_items: responseItems }
+    ...(hasResponseState
+      ? { _openai_response_state: responseState }
       : {}),
   } as MessageParam
 }
@@ -676,9 +679,11 @@ export function assistantMessageToMessageParam(
   enablePromptCaching: boolean,
   querySource?: QuerySource,
 ): MessageParam {
-  const responseItems = (
+  const responseState = (
     message.message as unknown as Record<string, unknown>
-  )._openai_response_items
+  )._openai_response_state
+  const hasResponseState =
+    !!responseState && typeof responseState === 'object'
   if (addCache) {
     if (typeof message.message.content === 'string') {
       return {
@@ -692,8 +697,8 @@ export function assistantMessageToMessageParam(
             }),
           },
         ],
-        ...(Array.isArray(responseItems)
-          ? { _openai_response_items: responseItems }
+        ...(hasResponseState
+          ? { _openai_response_state: responseState }
           : {}),
       } as MessageParam
     } else {
@@ -710,8 +715,8 @@ export function assistantMessageToMessageParam(
               : {}
             : {}),
         })),
-        ...(Array.isArray(responseItems)
-          ? { _openai_response_items: responseItems }
+        ...(hasResponseState
+          ? { _openai_response_state: responseState }
           : {}),
       } as MessageParam
     }
@@ -719,8 +724,8 @@ export function assistantMessageToMessageParam(
   return {
     role: 'assistant',
     content: message.message.content,
-    ...(Array.isArray(responseItems)
-      ? { _openai_response_items: responseItems }
+    ...(hasResponseState
+      ? { _openai_response_state: responseState }
       : {}),
   } as MessageParam
 }
@@ -2325,11 +2330,18 @@ async function* queryModel(
             // captures the final values.
             stopReason = part.delta.stop_reason
 
-            const responseItems = partialMessage
+            const responseState = partialMessage
               ? (
                   partialMessage as unknown as Record<string, unknown>
-                )._openai_response_items
+                )._openai_response_state
               : undefined
+            const responseItems =
+              responseState &&
+              typeof responseState === 'object' &&
+              'items' in responseState &&
+              Array.isArray(responseState.items)
+                ? responseState.items
+                : undefined
             let lastMsg = newMessages.at(-1)
             let metadataOnlyMessage: AssistantMessage | undefined
             // Responses can complete with only opaque reasoning state. Persist
@@ -2362,15 +2374,15 @@ async function* queryModel(
               lastMsg.message.usage = usage
               lastMsg.message.stop_reason = stopReason
 
-              if (Array.isArray(responseItems)) {
+              if (responseState && typeof responseState === 'object') {
                 for (const message of newMessages) {
-                  ;(
+                  delete (
                     message.message as unknown as Record<string, unknown>
-                  )._openai_response_items = []
+                  )._openai_response_state
                 }
                 ;(
                   lastMsg.message as unknown as Record<string, unknown>
-                )._openai_response_items = responseItems
+                )._openai_response_state = responseState
               }
             }
             if (metadataOnlyMessage) yield metadataOnlyMessage
@@ -2587,6 +2599,13 @@ async function* queryModel(
           // Throw a more specific error for timeout
           throw new APIConnectionTimeoutError({ message: 'Request timed out' })
         }
+      }
+
+      // A terminal Responses event is a completed server decision, not a
+      // broken stream. Retry transient failures through withRetry and surface
+      // permanent failures without changing transport modes.
+      if (isOpenAIResponsesResponseError(streamingError)) {
+        throw streamingError
       }
 
       // When the flag is enabled, skip the non-streaming fallback and let the

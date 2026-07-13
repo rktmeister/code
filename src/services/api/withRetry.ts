@@ -49,6 +49,7 @@ import {
   isOpenAICompatBackendAbortError,
   isOpenAICompatRetryableHTTPError,
   isOpenAICompatRetryableTransportError,
+  isOpenAIResponsesRetryableError,
 } from './openAICompatInferenceClient.js'
 
 const abortError = () => new APIUserAbortError()
@@ -414,11 +415,14 @@ export async function* withRetry<T>(
         isOpenAICompatRetryableHTTPError(error)
       const retryableOpenAICompatTransport =
         isOpenAICompatRetryableTransportError(error)
+      const retryableOpenAIResponses =
+        isOpenAIResponsesRetryableError(error)
       if (
         !handledCloudAuthError &&
         !retryableOpenAICompatAbort &&
         !retryableOpenAICompatHTTP &&
         !retryableOpenAICompatTransport &&
+        !retryableOpenAIResponses &&
         (!(error instanceof APIError) || !shouldRetry(error))
       ) {
         throw new CannotRetryError(error, retryContext)

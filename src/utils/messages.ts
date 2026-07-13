@@ -2379,9 +2379,9 @@ function prepareResponsesMessagesForProtocol(messages: Message[]): Message[] {
   return messages.map(message => {
     if (message.type !== 'assistant') return message
     const rawMessage = message.message as unknown as Record<string, unknown>
-    if (!Object.hasOwn(rawMessage, '_openai_response_items')) return message
+    if (!Object.hasOwn(rawMessage, '_openai_response_state')) return message
 
-    const { _openai_response_items: _ignored, ...withoutResponsesItems } =
+    const { _openai_response_state: _ignored, ...withoutResponsesState } =
       rawMessage
     const content = Array.isArray(rawMessage.content)
       ? rawMessage.content.flatMap(block => {
@@ -2405,7 +2405,7 @@ function prepareResponsesMessagesForProtocol(messages: Message[]): Message[] {
 
     return {
       ...message,
-      message: { ...withoutResponsesItems, content },
+      message: { ...withoutResponsesState, content },
     } as Message
   })
 }
@@ -2431,23 +2431,30 @@ export function mergeAssistantMessages(
   a: AssistantMessage,
   b: AssistantMessage,
 ): AssistantMessage {
-  const aResponseItems = (
+  const aResponseState = (
     a.message as unknown as Record<string, unknown>
-  )._openai_response_items
-  const bResponseItems = (
+  )._openai_response_state
+  const bResponseState = (
     b.message as unknown as Record<string, unknown>
-  )._openai_response_items
-  const responseItems =
-    Array.isArray(bResponseItems) && bResponseItems.length > 0
-      ? bResponseItems
-      : aResponseItems
+  )._openai_response_state
+  const bResponseItems =
+    bResponseState &&
+    typeof bResponseState === 'object' &&
+    'items' in bResponseState &&
+    Array.isArray(bResponseState.items)
+      ? bResponseState.items
+      : undefined
+  const responseState =
+    bResponseItems && bResponseItems.length > 0
+      ? bResponseState
+      : aResponseState
   return {
     ...a,
     message: {
       ...a.message,
       content: [...a.message.content, ...b.message.content],
-      ...(Array.isArray(responseItems)
-        ? { _openai_response_items: responseItems }
+      ...(responseState && typeof responseState === 'object'
+        ? { _openai_response_state: responseState }
         : {}),
     },
   }
@@ -5188,10 +5195,17 @@ export function filterOrphanedThinkingOnlyMessages(
       return true // Has non-thinking content, keep it
     }
 
-    const responseItems = (
+    const responseState = (
       msg.message as unknown as Record<string, unknown>
-    )._openai_response_items
-    if (Array.isArray(responseItems) && responseItems.length > 0) {
+    )._openai_response_state
+    const responseItems =
+      responseState &&
+      typeof responseState === 'object' &&
+      'items' in responseState &&
+      Array.isArray(responseState.items)
+        ? responseState.items
+        : undefined
+    if (responseItems && responseItems.length > 0) {
       return true
     }
 

@@ -105,6 +105,30 @@ export class OpenAICompatTransportError extends Error {
   }
 }
 
+const RETRYABLE_OPENAI_RESPONSE_ERROR_CODES = new Set([
+  'rate_limit_exceeded',
+  'server_error',
+])
+
+export class OpenAIResponsesResponseError extends Error {
+  readonly retryable: boolean
+
+  constructor(
+    public readonly code: string | undefined,
+    public readonly errorType: string | undefined,
+    detail?: string,
+  ) {
+    const label = [...new Set([code, errorType].filter(Boolean))].join('/')
+    super(
+      `OpenAI Responses request failed${label ? ` (${label})` : ''}${detail ? `: ${detail}` : ''}`,
+    )
+    this.name = 'OpenAIResponsesResponseError'
+    this.retryable =
+      typeof code === 'string' &&
+      RETRYABLE_OPENAI_RESPONSE_ERROR_CODES.has(code.toLowerCase())
+  }
+}
+
 export function isOpenAICompatBackendAbortError(
   error: unknown,
 ): error is OpenAICompatBackendAbortError {
@@ -156,6 +180,47 @@ export function isOpenAICompatRetryableTransportError(
   error: unknown,
 ): error is OpenAICompatTransportError {
   return error instanceof OpenAICompatTransportError
+}
+
+export function isOpenAIResponsesResponseError(
+  error: unknown,
+): error is OpenAIResponsesResponseError {
+  return error instanceof OpenAIResponsesResponseError
+}
+
+export function isOpenAIResponsesRetryableError(
+  error: unknown,
+): error is OpenAIResponsesResponseError {
+  return error instanceof OpenAIResponsesResponseError && error.retryable
+}
+
+export async function createOpenAICompatHTTPError(
+  response: Response,
+): Promise<OpenAICompatHTTPError> {
+  let detail: string | undefined
+  let errorCode: string | undefined
+  let errorType: string | undefined
+  try {
+    const body = (await response.json()) as Record<string, unknown>
+    const nested =
+      body.error && typeof body.error === 'object'
+        ? (body.error as Record<string, unknown>)
+        : undefined
+    const candidate = nested?.message ?? body.message ?? body.detail
+    if (typeof candidate === 'string' && candidate.trim()) {
+      detail = candidate.replace(/\s+/g, ' ').trim().slice(0, 1000)
+    }
+    if (typeof nested?.code === 'string') errorCode = nested.code
+    if (typeof nested?.type === 'string') errorType = nested.type
+  } catch {
+    // Non-JSON error pages do not contain safe, structured API diagnostics.
+  }
+  return new OpenAICompatHTTPError(
+    response.status,
+    response.statusText,
+    detail,
+    { headers: response.headers, errorCode, errorType },
+  )
 }
 
 function getErrorCode(error: unknown): string | undefined {
@@ -1801,12 +1866,7 @@ export class OpenAICompatInferenceClient implements InferenceClient {
 
     const operation = createInferenceOperation(responsePromise, async response => {
       if (!response.ok) {
-        throw new OpenAICompatHTTPError(
-          response.status,
-          response.statusText,
-          undefined,
-          { headers: response.headers },
-        )
+        throw await createOpenAICompatHTTPError(response)
       }
       if (params.stream) {
         const controller = new AbortController()
