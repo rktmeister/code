@@ -12,6 +12,8 @@ import {
   getWrappedClientFetch,
 } from './client.js'
 import { OpenAICompatInferenceClient } from './openAICompatInferenceClient.js'
+import { OpenAIResponsesInferenceClient } from './openAIResponsesInferenceClient.js'
+import { getOpenAIApiFormat } from '../../utils/model/providers.js'
 import { getNCodeManagedModelBaseUrl } from '../../utils/model/ncodeModels.js'
 import { getDirectApiKeyEnvValue } from '../../utils/authEnv.js'
 import { getUserAgent } from '../../utils/http.js'
@@ -46,21 +48,46 @@ export interface InferenceClient {
   createMessage(...args: InferenceCreateMessageArgs): InferenceCreateMessageResult
   countTokens(...args: InferenceCountTokensArgs): InferenceCountTokensResult
   listModels(...args: InferenceListModelsArgs): InferenceListModelsResult
+  compactResponse?(
+    params: InferenceCreateMessageArgs[0],
+    options?: InferenceCreateMessageArgs[1],
+  ): Promise<{ output: Array<Record<string, unknown>>; usage?: unknown }>
 }
 
 class AnthropicInferenceClient implements InferenceClient {
   constructor(private readonly anthropic: Anthropic) {}
 
+  private stripResponsesMetadata<T extends { messages: unknown[] }>(
+    params: T,
+  ): T {
+    const messages = params.messages.map(message => {
+      const {
+        _openai_response_items: _ignored,
+        ...anthropicMessage
+      } = message as Record<string, unknown>
+      return anthropicMessage
+    })
+    return { ...params, messages } as T
+  }
+
   createMessage(
     ...args: InferenceCreateMessageArgs
   ): InferenceCreateMessageResult {
-    return this.anthropic.beta.messages.create(...args)
+    const [params, options] = args
+    return this.anthropic.beta.messages.create(
+      this.stripResponsesMetadata(params),
+      options,
+    )
   }
 
   countTokens(
     ...args: InferenceCountTokensArgs
   ): InferenceCountTokensResult {
-    return this.anthropic.beta.messages.countTokens(...args)
+    const [params, options] = args
+    return this.anthropic.beta.messages.countTokens(
+      this.stripResponsesMetadata(params),
+      options,
+    )
   }
 
   listModels(...args: InferenceListModelsArgs): InferenceListModelsResult {
@@ -113,7 +140,11 @@ export async function getInferenceClient(
     const apiKey = getDirectApiKeyEnvValue()
     const baseURL = getOpenAICompatBaseUrl()
     if (apiKey && baseURL) {
-      return new OpenAICompatInferenceClient({
+      const Client =
+        getOpenAIApiFormat() === 'responses'
+          ? OpenAIResponsesInferenceClient
+          : OpenAICompatInferenceClient
+      return new Client({
         baseURL,
         headers: getOpenAICompatByokHeaders(apiKey),
         useNCodeManagedModelRouting: false,

@@ -5,6 +5,7 @@ import {
   getNoumenaBaseUrl,
   getOpenAICompatBaseUrl,
   getOpenAICompatDefaultModel,
+  getOpenAIApiFormat,
   isOpenAICompatByokActive,
   isFirstPartyNoumenaBaseUrl,
 } from './providers.js'
@@ -15,6 +16,7 @@ function resetEnv() {
   delete process.env.OPENAI_API_KEY
   delete process.env.OPENAI_BASE_URL
   delete process.env.OPENAI_MODEL
+  delete process.env.OPENAI_API_FORMAT
   delete process.env.USER_TYPE
 }
 
@@ -89,6 +91,14 @@ describe('providers', () => {
 
     expect(getOpenAICompatBaseUrl()).toBe('https://openrouter.ai/api/v1')
     expect(getOpenAICompatDefaultModel()).toBe('openrouter/custom-model')
+  })
+
+  it('requires an explicit valid Responses format opt-in', () => {
+    expect(getOpenAIApiFormat()).toBe('chat_completions')
+    process.env.OPENAI_API_FORMAT = 'responses'
+    expect(getOpenAIApiFormat()).toBe('responses')
+    process.env.OPENAI_API_FORMAT = 'invalid'
+    expect(() => getOpenAIApiFormat()).toThrow('Invalid OPENAI_API_FORMAT')
   })
 
 })

@@ -618,6 +618,9 @@ export function userMessageToMessageParam(
   enablePromptCaching: boolean,
   querySource?: QuerySource,
 ): MessageParam {
+  const responseItems = (
+    message.message as unknown as Record<string, unknown>
+  )._openai_response_items
   if (addCache) {
     if (typeof message.message.content === 'string') {
       return {
@@ -631,7 +634,10 @@ export function userMessageToMessageParam(
             }),
           },
         ],
-      }
+        ...(Array.isArray(responseItems)
+          ? { _openai_response_items: responseItems }
+          : {}),
+      } as MessageParam
     } else {
       return {
         role: 'user',
@@ -643,7 +649,10 @@ export function userMessageToMessageParam(
               : {}
             : {}),
         })),
-      }
+        ...(Array.isArray(responseItems)
+          ? { _openai_response_items: responseItems }
+          : {}),
+      } as MessageParam
     }
   }
   // Clone array content to prevent in-place mutations (e.g., insertCacheEditsBlock's
@@ -654,7 +663,10 @@ export function userMessageToMessageParam(
     content: Array.isArray(message.message.content)
       ? [...message.message.content]
       : message.message.content,
-  }
+    ...(Array.isArray(responseItems)
+      ? { _openai_response_items: responseItems }
+      : {}),
+  } as MessageParam
 }
 
 export function assistantMessageToMessageParam(
@@ -663,6 +675,9 @@ export function assistantMessageToMessageParam(
   enablePromptCaching: boolean,
   querySource?: QuerySource,
 ): MessageParam {
+  const responseItems = (
+    message.message as unknown as Record<string, unknown>
+  )._openai_response_items
   if (addCache) {
     if (typeof message.message.content === 'string') {
       return {
@@ -676,7 +691,10 @@ export function assistantMessageToMessageParam(
             }),
           },
         ],
-      }
+        ...(Array.isArray(responseItems)
+          ? { _openai_response_items: responseItems }
+          : {}),
+      } as MessageParam
     } else {
       return {
         role: 'assistant',
@@ -691,13 +709,19 @@ export function assistantMessageToMessageParam(
               : {}
             : {}),
         })),
-      }
+        ...(Array.isArray(responseItems)
+          ? { _openai_response_items: responseItems }
+          : {}),
+      } as MessageParam
     }
   }
   return {
     role: 'assistant',
     content: message.message.content,
-  }
+    ...(Array.isArray(responseItems)
+      ? { _openai_response_items: responseItems }
+      : {}),
+  } as MessageParam
 }
 
 export type Options = {

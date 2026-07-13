@@ -33,6 +33,7 @@ function withoutSSHTunnelVars(
     OPENAI_API_KEY: _5,
     OPENAI_BASE_URL: _6,
     OPENAI_MODEL: _7,
+    OPENAI_API_FORMAT: _10,
     ANTHROPIC_AUTH_TOKEN: _8,
     CLAUDE_CODE_OAUTH_TOKEN: _9,
     ...rest
@@ -88,6 +89,7 @@ const PROJECT_SETTINGS_OPENAI_BYOK_ENV_VARS = new Set([
   'OPENAI_API_KEY',
   'OPENAI_BASE_URL',
   'OPENAI_MODEL',
+  'OPENAI_API_FORMAT',
 ])
 
 function withoutProjectSettingsOpenAIByokVars(

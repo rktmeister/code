@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { getInferenceClient } from './inferenceClient.js'
 import { OpenAICompatInferenceClient } from './openAICompatInferenceClient.js'
+import { OpenAIResponsesInferenceClient } from './openAIResponsesInferenceClient.js'
 import { enableConfigs } from '../../utils/config.js'
 import { getClaudeAIOAuthTokens } from '../../utils/auth.js'
 import {
@@ -26,6 +27,7 @@ const envKeys = [
   'OPENAI_API_KEY',
   'OPENAI_BASE_URL',
   'OPENAI_MODEL',
+  'OPENAI_API_FORMAT',
   'ANTHROPIC_AUTH_TOKEN',
   'CLAUDE_CODE_OAUTH_TOKEN',
   'NCODE_CONFIG_DIR',
@@ -65,6 +67,7 @@ function setStableTestRuntime() {
   delete process.env.OPENAI_API_KEY
   delete process.env.OPENAI_BASE_URL
   delete process.env.OPENAI_MODEL
+  delete process.env.OPENAI_API_FORMAT
   delete process.env.CI
 
   process.env.ANTHROPIC_API_KEY = 'anthropic-direct-test-key'
@@ -434,6 +437,18 @@ describe('getInferenceClient', () => {
     expect(request.headers.get('x-api-key')).toBeNull()
     expect(request.headers.get('anthropic-beta')).toBeNull()
     expect(request.headers.get('x-client-request-id')).toBeNull()
+  })
+
+  it('selects the Responses client only when explicitly configured', async () => {
+    delete process.env.NOUMENA_BASE_URL
+    delete process.env.ANTHROPIC_BASE_URL
+    delete process.env.NOUMENA_API_KEY
+    delete process.env.ANTHROPIC_API_KEY
+    process.env.OPENAI_API_KEY = 'openai-static-env-key'
+    process.env.OPENAI_API_FORMAT = 'responses'
+
+    const client = await getInferenceClient({ maxRetries: 1, source: 'responses' })
+    expect(client).toBeInstanceOf(OpenAIResponsesInferenceClient)
   })
 
   it('preserves path-prefixed OPENAI_BASE_URL values for OpenAI-compatible BYOK', async () => {

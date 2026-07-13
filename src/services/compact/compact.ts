@@ -1,5 +1,5 @@
 import { feature } from 'bun:bundle'
-import type { UUID } from 'crypto'
+import { randomUUID, type UUID } from 'crypto'
 import uniqBy from 'lodash-es/uniqBy.js'
 
 /* eslint-disable @typescript-eslint/no-require-imports */
@@ -102,8 +102,12 @@ import {
 } from '../analytics/index.js'
 import {
   getMaxOutputTokensForModel,
+  assistantMessageToMessageParam,
   queryModelWithStreaming,
+  userMessageToMessageParam,
 } from '../api/claude.js'
+import { getInferenceClient } from '../api/inferenceClient.js'
+import { toolToAPISchema } from '../../utils/api.js'
 import {
   getPromptTooLongTokenGap,
   PROMPT_TOO_LONG_ERROR_MESSAGE,
@@ -458,8 +462,66 @@ export async function compactConversation(
     let retryCacheSafeParams = cacheSafeParams
     let summaryResponse: AssistantMessage
     let summary: string | null
+    let remoteCompactItems: Array<Record<string, unknown>> | undefined
     let ptlAttempts = 0
-    for (;;) {
+    const compactClient = await getInferenceClient({
+      maxRetries: 0,
+      model: context.options.mainLoopModel,
+      source: 'compact',
+    })
+    if (compactClient.compactResponse) {
+      const normalized = normalizeMessagesForAPI(messages, context.options.tools)
+      const apiMessages = normalized.map(message =>
+        message.type === 'user'
+          ? userMessageToMessageParam(message, false, false)
+          : assistantMessageToMessageParam(message, false, false),
+      )
+      const tools = await Promise.all(
+        context.options.tools.map(tool =>
+          toolToAPISchema(tool, {
+            getToolPermissionContext: async () =>
+              context.getAppState().toolPermissionContext,
+            tools: context.options.tools,
+            agents: context.options.agentDefinitions.activeAgents,
+            model: context.options.mainLoopModel,
+          }),
+        ),
+      )
+      const compacted = await compactClient.compactResponse(
+        {
+          model: context.options.mainLoopModel,
+          messages: apiMessages,
+          system: context.renderedSystemPrompt
+            ? [{ type: 'text', text: String(context.renderedSystemPrompt) }]
+            : undefined,
+          tools,
+          max_tokens: COMPACT_MAX_OUTPUT_TOKENS,
+        } as never,
+        { signal: context.abortController.signal },
+      )
+      remoteCompactItems = compacted.output
+      summary = '[OpenAI Responses compacted context]'
+      summaryResponse = {
+        type: 'assistant',
+        uuid: randomUUID(),
+        timestamp: new Date().toISOString(),
+        message: {
+          id: randomUUID(),
+          type: 'message',
+          role: 'assistant',
+          model: context.options.mainLoopModel,
+          content: [{ type: 'text', text: summary }],
+          stop_reason: 'end_turn',
+          stop_sequence: null,
+          usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+          },
+        },
+      } as AssistantMessage
+    } else for (;;) {
       summaryResponse = await streamCompactSummary({
         messages: messagesToSummarize,
         summaryRequest,
@@ -634,6 +696,11 @@ export async function compactConversation(
         isVisibleInTranscriptOnly: true,
       }),
     ]
+    if (remoteCompactItems) {
+      ;(
+        summaryMessages[0]!.message as unknown as Record<string, unknown>
+      )._openai_response_items = remoteCompactItems
+    }
 
     // Previously "postCompactTokenCount" — renamed because this is the
     // compact API call's total usage (input_tokens ≈ preCompactTokenCount),

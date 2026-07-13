@@ -18,7 +18,12 @@ describe('managedEnvConstants GrowthBook ownership', () => {
 
 
   it('treats OpenAI-compatible BYOK routing and auth vars as provider-managed and unsafe', () => {
-    for (const key of ['OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_MODEL']) {
+    for (const key of [
+      'OPENAI_API_KEY',
+      'OPENAI_BASE_URL',
+      'OPENAI_MODEL',
+      'OPENAI_API_FORMAT',
+    ]) {
       expect(isProviderManagedEnvVar(key)).toBe(true)
       expect(SAFE_ENV_VARS.has(key)).toBe(false)
     }
