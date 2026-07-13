@@ -2296,6 +2296,20 @@ async function* queryModel(
             if (lastMsg) {
               lastMsg.message.usage = usage
               lastMsg.message.stop_reason = stopReason
+
+              const responseItems = (
+                partialMessage as unknown as Record<string, unknown>
+              )._openai_response_items
+              if (Array.isArray(responseItems)) {
+                for (const message of newMessages) {
+                  ;(
+                    message.message as unknown as Record<string, unknown>
+                  )._openai_response_items = []
+                }
+                ;(
+                  lastMsg.message as unknown as Record<string, unknown>
+                )._openai_response_items = responseItems
+              }
             }
 
             // Update cost

@@ -500,6 +500,14 @@ export async function compactConversation(
         { signal: context.abortController.signal },
       )
       remoteCompactItems = compacted.output
+      const compactUsage = compacted.usage as
+        | {
+            input_tokens?: number
+            output_tokens?: number
+            cache_creation_input_tokens?: number
+            cache_read_input_tokens?: number
+          }
+        | undefined
       summary = '[OpenAI Responses compacted context]'
       summaryResponse = {
         type: 'assistant',
@@ -514,10 +522,12 @@ export async function compactConversation(
           stop_reason: 'end_turn',
           stop_sequence: null,
           usage: {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
+            input_tokens: compactUsage?.input_tokens ?? 0,
+            output_tokens: compactUsage?.output_tokens ?? 0,
+            cache_creation_input_tokens:
+              compactUsage?.cache_creation_input_tokens ?? 0,
+            cache_read_input_tokens:
+              compactUsage?.cache_read_input_tokens ?? 0,
           },
         },
       } as AssistantMessage

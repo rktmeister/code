@@ -89,16 +89,118 @@ function contentText(content: unknown): string {
     .join('')
 }
 
+function responseItemKey(item: ResponseItem): string {
+  if (typeof item.id === 'string') return `${item.type}:id:${item.id}`
+  if (typeof item.call_id === 'string') {
+    return `${item.type}:call_id:${item.call_id}`
+  }
+  return `${item.type}:value:${JSON.stringify(item)}`
+}
+
+function convertInputBlock(block: unknown): Record<string, unknown> {
+  if (!block || typeof block !== 'object' || !('type' in block)) {
+    throw new Error('Unsupported empty Responses input content block')
+  }
+  if (
+    block.type === 'text' &&
+    'text' in block &&
+    typeof block.text === 'string'
+  ) {
+    return { type: 'input_text', text: block.text }
+  }
+  if (
+    block.type === 'image' &&
+    'source' in block &&
+    block.source &&
+    typeof block.source === 'object'
+  ) {
+    const source = block.source as Record<string, unknown>
+    if (
+      source.type === 'base64' &&
+      typeof source.data === 'string' &&
+      typeof source.media_type === 'string'
+    ) {
+      return {
+        type: 'input_image',
+        image_url: `data:${source.media_type};base64,${source.data}`,
+      }
+    }
+    if (source.type === 'url' && typeof source.url === 'string') {
+      return { type: 'input_image', image_url: source.url }
+    }
+    if (source.type === 'file' && typeof source.file_id === 'string') {
+      return { type: 'input_image', file_id: source.file_id }
+    }
+    throw new Error(
+      `Unsupported Responses image source: ${String(source.type)}`,
+    )
+  }
+  if (
+    block.type === 'document' &&
+    'source' in block &&
+    block.source &&
+    typeof block.source === 'object'
+  ) {
+    const source = block.source as Record<string, unknown>
+    if (
+      source.type === 'base64' &&
+      typeof source.data === 'string' &&
+      typeof source.media_type === 'string'
+    ) {
+      return {
+        type: 'input_file',
+        filename:
+          'title' in block && typeof block.title === 'string'
+            ? block.title
+            : 'document.pdf',
+        file_data: `data:${source.media_type};base64,${source.data}`,
+      }
+    }
+    if (source.type === 'url' && typeof source.url === 'string') {
+      return { type: 'input_file', file_url: source.url }
+    }
+    if (source.type === 'file' && typeof source.file_id === 'string') {
+      return { type: 'input_file', file_id: source.file_id }
+    }
+    if (source.type === 'text' && typeof source.data === 'string') {
+      return { type: 'input_text', text: source.data }
+    }
+    throw new Error(
+      `Unsupported Responses document source: ${String(source.type)}`,
+    )
+  }
+  throw new Error(
+    `Unsupported Responses input content block: ${String(block.type)}`,
+  )
+}
+
+function convertInputContent(
+  content: unknown,
+): string | Record<string, unknown>[] {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) {
+    throw new Error('Responses input content must be a string or array')
+  }
+  return content.map(convertInputBlock)
+}
+
 function convertMessages(messages: unknown): ResponseItem[] {
   if (!Array.isArray(messages)) {
     throw new Error('Inference messages must be an array')
   }
   const input: ResponseItem[] = []
+  const seenResponseItems = new Set<string>()
   for (const message of messages) {
     if (!message || typeof message !== 'object' || !('role' in message)) continue
     const raw = (message as Record<string, unknown>)[OPENAI_RESPONSE_ITEMS_FIELD]
     if (Array.isArray(raw)) {
-      input.push(...(raw as ResponseItem[]))
+      for (const item of raw as ResponseItem[]) {
+        const key = responseItemKey(item)
+        if (!seenResponseItems.has(key)) {
+          seenResponseItems.add(key)
+          input.push(item)
+        }
+      }
       continue
     }
     const role = message.role
@@ -115,22 +217,30 @@ function convertMessages(messages: unknown): ResponseItem[] {
           input.push({
             type: 'function_call_output',
             call_id: block.tool_use_id,
-            output: contentText(block.content),
+            output: convertInputContent(block.content),
           })
         }
-        const text = contentText(
-          content.filter(
-            block =>
-              !(
-                block &&
-                typeof block === 'object' &&
-                block.type === 'tool_result'
-              ),
-          ),
+        const userContent = content.filter(
+          block =>
+            !(
+              block &&
+              typeof block === 'object' &&
+              block.type === 'tool_result'
+            ),
         )
-        if (text) input.push({ type: 'message', role: 'user', content: text })
+        if (userContent.length > 0) {
+          input.push({
+            type: 'message',
+            role: 'user',
+            content: convertInputContent(userContent),
+          })
+        }
       } else {
-        input.push({ type: 'message', role: 'user', content: contentText(content) })
+        input.push({
+          type: 'message',
+          role: 'user',
+          content: convertInputContent(content),
+        })
       }
       continue
     }
@@ -156,6 +266,7 @@ function convertToolChoice(value: unknown): unknown {
   if (!value || typeof value === 'string') return value ?? 'auto'
   if (typeof value !== 'object') return 'auto'
   if ('type' in value && value.type === 'any') return 'required'
+  if ('type' in value && value.type === 'none') return 'none'
   if (
     'type' in value &&
     value.type === 'tool' &&
@@ -165,6 +276,47 @@ function convertToolChoice(value: unknown): unknown {
     return { type: 'function', name: value.name }
   }
   return 'auto'
+}
+
+function convertParallelToolCalls(value: unknown): boolean | undefined {
+  if (!value || typeof value !== 'object') return undefined
+  return 'disable_parallel_tool_use' in value &&
+    value.disable_parallel_tool_use === true
+    ? false
+    : undefined
+}
+
+function convertOutputFormat(
+  value: unknown,
+): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || !('format' in value)) {
+    return undefined
+  }
+  const format = value.format
+  if (!format || typeof format !== 'object' || !('type' in format)) {
+    return undefined
+  }
+  if (format.type === 'json_object') return { type: 'json_object' }
+  if (format.type === 'json_schema' && 'schema' in format) {
+    const schema = format.schema
+    return {
+      type: 'json_schema',
+      name:
+        'name' in format && typeof format.name === 'string'
+          ? format.name
+          : schema &&
+              typeof schema === 'object' &&
+              'title' in schema &&
+              typeof schema.title === 'string'
+            ? schema.title
+            : 'Schema',
+      schema,
+      strict: 'strict' in format && format.strict === true,
+    }
+  }
+  throw new Error(
+    `Unsupported Responses output format: ${String(format.type)}`,
+  )
 }
 
 function convertTools(tools: unknown): ResponseItem[] | undefined {
@@ -186,6 +338,8 @@ export function buildOpenAIResponsesRequest(
       ? 'none'
       : ((params.output_config as { effort?: string } | undefined)?.effort ??
         'high')
+  const outputFormat = convertOutputFormat(params.output_config)
+  const parallelToolCalls = convertParallelToolCalls(params.tool_choice)
   return {
     model: params.model,
     input: convertMessages(params.messages),
@@ -194,21 +348,40 @@ export function buildOpenAIResponsesRequest(
       : {}),
     ...(convertTools(params.tools) ? { tools: convertTools(params.tools) } : {}),
     tool_choice: convertToolChoice(params.tool_choice),
+    ...(parallelToolCalls !== undefined
+      ? { parallel_tool_calls: parallelToolCalls }
+      : {}),
     max_output_tokens: params.max_tokens,
     reasoning: { effort, summary: 'auto' },
+    ...(outputFormat ? { text: { format: outputFormat } } : {}),
     include: ['reasoning.encrypted_content'],
     store: false,
     ...(params.stream ? { stream: true } : {}),
   }
 }
 
+function refusalText(response: OpenAIResponse): string {
+  return (response.output ?? [])
+    .flatMap(item =>
+      item.type === 'message' && Array.isArray(item.content)
+        ? (item.content as Array<Record<string, unknown>>)
+        : [],
+    )
+    .filter(part => part.type === 'refusal' && typeof part.refusal === 'string')
+    .map(part => String(part.refusal))
+    .join('')
+}
+
 function messageFromResponse(response: OpenAIResponse): BetaMessage {
   const content: Array<Record<string, unknown>> = []
+  const refusal = refusalText(response)
   for (const item of response.output ?? []) {
     if (item.type === 'message' && Array.isArray(item.content)) {
       for (const part of item.content as Array<Record<string, unknown>>) {
         if (part.type === 'output_text' && typeof part.text === 'string') {
           content.push({ type: 'text', text: part.text })
+        } else if (part.type === 'refusal' && typeof part.refusal === 'string') {
+          content.push({ type: 'text', text: part.refusal })
         }
       }
     } else if (item.type === 'function_call') {
@@ -237,7 +410,9 @@ function messageFromResponse(response: OpenAIResponse): BetaMessage {
     role: 'assistant',
     model: response.model ?? 'unknown',
     content,
-    stop_reason: content.some(block => block.type === 'tool_use')
+    stop_reason: refusal
+      ? 'refusal'
+      : content.some(block => block.type === 'tool_use')
       ? 'tool_use'
       : response.status === 'incomplete'
         ? 'max_tokens'
@@ -265,7 +440,9 @@ async function* streamEvents(
   const tools = new Map<number, { index: number; id: string; name: string }>()
   const items: ResponseItem[] = []
   let finalUsage = usage()
-  let stopReason: 'tool_use' | 'max_tokens' | 'end_turn' = 'end_turn'
+  let stopReason: 'tool_use' | 'max_tokens' | 'end_turn' | 'refusal' =
+    'end_turn'
+  let terminalReceived = false
 
   yield {
     type: 'message_start',
@@ -297,6 +474,21 @@ async function* streamEvents(
           id = r.id ?? id
           model = r.model ?? model
         } else if (type === 'response.output_text.delta') {
+          if (textIndex === undefined) {
+            textIndex = nextIndex++
+            yield {
+              type: 'content_block_start',
+              index: textIndex,
+              content_block: { type: 'text', text: '' },
+            } as BetaRawMessageStreamEvent
+          }
+          yield {
+            type: 'content_block_delta',
+            index: textIndex,
+            delta: { type: 'text_delta', text: String(event.delta ?? '') },
+          } as BetaRawMessageStreamEvent
+        } else if (type === 'response.refusal.delta') {
+          stopReason = 'refusal'
           if (textIndex === undefined) {
             textIndex = nextIndex++
             yield {
@@ -373,9 +565,28 @@ async function* streamEvents(
           }
         } else if (type === 'response.completed' || type === 'response.incomplete') {
           const r = event.response as OpenAIResponse
-          finalUsage = usage(r.usage)
+          terminalReceived = true
+          Object.assign(finalUsage, usage(r.usage))
           if (r.output?.length) items.splice(0, items.length, ...r.output)
-          if (r.status === 'incomplete') stopReason = 'max_tokens'
+          const refusal = refusalText(r)
+          if (refusal) {
+            stopReason = 'refusal'
+            if (textIndex === undefined) {
+              textIndex = nextIndex++
+              yield {
+                type: 'content_block_start',
+                index: textIndex,
+                content_block: { type: 'text', text: '' },
+              } as BetaRawMessageStreamEvent
+              yield {
+                type: 'content_block_delta',
+                index: textIndex,
+                delta: { type: 'text_delta', text: refusal },
+              } as BetaRawMessageStreamEvent
+            }
+          } else if (r.status === 'incomplete') {
+            stopReason = 'max_tokens'
+          }
         } else if (type === 'error' || type === 'response.failed') {
           throw new Error(
             `Responses API stream failed: ${JSON.stringify(event.error ?? event)}`,
@@ -387,6 +598,11 @@ async function* streamEvents(
   } finally {
     if (controller.signal.aborted) void reader.cancel().catch(() => {})
     reader.releaseLock()
+  }
+  if (!terminalReceived) {
+    throw new OpenAICompatTransportError(
+      'Responses API stream ended before a terminal response event',
+    )
   }
   if (thinkingIndex !== undefined) {
     yield {
@@ -469,8 +685,21 @@ export class OpenAIResponsesInferenceClient implements InferenceClient {
   createMessage(...args: InferenceCreateMessageArgs): InferenceCreateMessageResult {
     const [params, options] = args
     const controller = new AbortController()
-    if (options?.signal) options.signal.addEventListener('abort', () => controller.abort(), { once: true })
-    const responsePromise = this.request('/v1/responses', buildOpenAIResponsesRequest(params), controller.signal, options?.headers)
+    if (options?.signal?.aborted) {
+      controller.abort(options.signal.reason)
+    } else if (options?.signal) {
+      options.signal.addEventListener(
+        'abort',
+        () => controller.abort(options.signal?.reason),
+        { once: true },
+      )
+    }
+    const responsePromise = this.request(
+      '/v1/responses',
+      buildOpenAIResponsesRequest(params),
+      controller.signal,
+      options?.headers,
+    )
     return operation(responsePromise, async response => {
       if (!response.ok) throw new OpenAICompatHTTPError(response.status, response.statusText)
       if (params.stream) return new SDKStream(() => streamEvents(response, params.model, controller), controller) as never
@@ -481,7 +710,10 @@ export class OpenAIResponsesInferenceClient implements InferenceClient {
   async compactResponse(
     params: InferenceCreateMessageArgs[0],
     options?: InferenceCreateMessageArgs[1],
-  ): Promise<{ output: Array<Record<string, unknown>>; usage?: ResponseUsage | null }> {
+  ): Promise<{
+    output: Array<Record<string, unknown>>
+    usage: ReturnType<typeof usage>
+  }> {
     const request = buildOpenAIResponsesRequest({ ...params, stream: false })
     const response = await this.request(
       '/v1/responses/compact',
@@ -493,12 +725,39 @@ export class OpenAIResponsesInferenceClient implements InferenceClient {
       throw new OpenAICompatHTTPError(response.status, response.statusText)
     }
     const body = (await response.json()) as OpenAIResponse
-    return { output: body.output ?? [], usage: body.usage }
+    return { output: body.output ?? [], usage: usage(body.usage) }
   }
 
   countTokens(...args: InferenceCountTokensArgs): InferenceCountTokensResult {
-    const [params] = args
-    return this.createMessage({ model: params.model, messages: params.messages, max_tokens: 1, stream: false } as InferenceCreateMessageArgs[0]).then(message => ({ input_tokens: message.usage.input_tokens + (message.usage.cache_read_input_tokens ?? 0) })) as InferenceCountTokensResult
+    const [params, options] = args
+    const createRequest = buildOpenAIResponsesRequest({
+      ...params,
+      max_tokens: 1,
+      stream: false,
+    } as InferenceCreateMessageArgs[0])
+    const {
+      include: _include,
+      max_output_tokens: _maxOutputTokens,
+      store: _store,
+      ...request
+    } = createRequest
+    return this.request(
+      '/v1/responses/input_tokens',
+      request,
+      options?.signal,
+      options?.headers,
+    ).then(async response => {
+      if (!response.ok) {
+        throw new OpenAICompatHTTPError(response.status, response.statusText)
+      }
+      const body = (await response.json()) as { input_tokens?: number }
+      if (typeof body.input_tokens !== 'number') {
+        throw new OpenAICompatTransportError(
+          'Responses input-token endpoint returned no input_tokens value',
+        )
+      }
+      return { input_tokens: body.input_tokens }
+    }) as InferenceCountTokensResult
   }
 
   listModels(...args: InferenceListModelsArgs): InferenceListModelsResult {
