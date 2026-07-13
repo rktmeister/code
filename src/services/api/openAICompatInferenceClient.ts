@@ -65,8 +65,20 @@ export class OpenAICompatHTTPError extends Error {
   readonly status: number
   readonly statusText: string
   readonly detail?: string
+  readonly headers?: Headers
+  readonly errorCode?: string
+  readonly errorType?: string
 
-  constructor(status: number, statusText: string, detail?: string) {
+  constructor(
+    status: number,
+    statusText: string,
+    detail?: string,
+    metadata?: {
+      headers?: Headers
+      errorCode?: string
+      errorType?: string
+    },
+  ) {
     super(
       `OpenAI compat inference request failed: ${status} ${statusText}${detail ? `: ${detail}` : ''}`,
     )
@@ -74,6 +86,9 @@ export class OpenAICompatHTTPError extends Error {
     this.status = status
     this.statusText = statusText
     this.detail = detail
+    this.headers = metadata?.headers
+    this.errorCode = metadata?.errorCode
+    this.errorType = metadata?.errorType
   }
 }
 
@@ -82,7 +97,7 @@ export class OpenAICompatTransportError extends Error {
 
   constructor(
     message: string,
-    public readonly originalError: unknown,
+    public readonly originalError: unknown = undefined,
   ) {
     super(`OpenAI compat inference transport failed: ${message}`)
     this.name = 'OpenAICompatTransportError'
@@ -105,7 +120,36 @@ export function isOpenAICompatMalformedToolOutputError(
 export function isOpenAICompatRetryableHTTPError(
   error: unknown,
 ): error is OpenAICompatHTTPError {
-  return error instanceof OpenAICompatHTTPError && error.status >= 500
+  if (!(error instanceof OpenAICompatHTTPError)) return false
+  if (error.status === 429 && isTerminalQuotaError(error)) return false
+  return (
+    error.status === 408 ||
+    error.status === 409 ||
+    error.status === 429 ||
+    error.status >= 500
+  )
+}
+
+function isTerminalQuotaError(error: OpenAICompatHTTPError): boolean {
+  const structured = `${error.errorCode ?? ''} ${error.errorType ?? ''}`
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+  if (
+    structured.includes('insufficient_quota') ||
+    structured.includes('billing_hard_limit') ||
+    structured.includes('billing_not_active') ||
+    structured.includes('usage_limit_reached') ||
+    structured.includes('quota_exceeded')
+  ) {
+    return true
+  }
+
+  const detail = error.detail?.toLowerCase() ?? ''
+  return (
+    detail.includes('insufficient quota') ||
+    detail.includes('billing hard limit') ||
+    detail.includes('billing is not active')
+  )
 }
 
 export function isOpenAICompatRetryableTransportError(
@@ -1757,7 +1801,12 @@ export class OpenAICompatInferenceClient implements InferenceClient {
 
     const operation = createInferenceOperation(responsePromise, async response => {
       if (!response.ok) {
-        throw new OpenAICompatHTTPError(response.status, response.statusText)
+        throw new OpenAICompatHTTPError(
+          response.status,
+          response.statusText,
+          undefined,
+          { headers: response.headers },
+        )
       }
       if (params.stream) {
         const controller = new AbortController()

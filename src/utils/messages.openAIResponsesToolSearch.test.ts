@@ -164,4 +164,79 @@ describe('Responses tool-search message normalization', () => {
       )._openai_response_items,
     ).toEqual(responseItems)
   })
+
+  it('keeps opaque state on a reasoning-only Responses message', () => {
+    const responseItems = [
+      { type: 'reasoning', id: 'reasoning-1', encrypted_content: 'opaque' },
+    ]
+    const normalized = normalizeMessagesForAPI([
+      {
+        type: 'assistant',
+        uuid: 'assistant-reasoning',
+        timestamp: '2026-01-01T00:00:00.000Z',
+        message: {
+          id: 'response-1',
+          type: 'message',
+          role: 'assistant',
+          model: 'gpt-test',
+          stop_reason: 'end_turn',
+          stop_sequence: null,
+          usage: {
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+          },
+          content: [
+            { type: 'thinking', thinking: 'Summary', signature: '' },
+          ],
+          _openai_response_items: responseItems,
+        },
+      },
+    ] as never)
+
+    expect(normalized).toHaveLength(1)
+    expect(
+      (normalized[0]!.message as unknown as Record<string, unknown>)
+        ._openai_response_items,
+    ).toEqual(responseItems)
+  })
+
+  it('converts Responses reasoning summaries to text for Anthropic', () => {
+    delete process.env.OPENAI_API_KEY
+    process.env.ANTHROPIC_API_KEY = 'test-key'
+    const normalized = normalizeMessagesForAPI([
+      {
+        type: 'assistant',
+        uuid: 'assistant-mixed',
+        timestamp: '2026-01-01T00:00:00.000Z',
+        message: {
+          id: 'response-1',
+          type: 'message',
+          role: 'assistant',
+          model: 'gpt-test',
+          stop_reason: 'end_turn',
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+          content: [
+            { type: 'thinking', thinking: 'Reasoning summary', signature: '' },
+            { type: 'text', text: 'Visible answer' },
+          ],
+          _openai_response_items: [
+            { type: 'reasoning', id: 'reasoning-1', encrypted_content: 'opaque' },
+          ],
+        },
+      },
+    ] as never)
+
+    expect(normalized).toHaveLength(1)
+    expect(normalized[0]!.message.content).toEqual([
+      { type: 'text', text: 'Reasoning summary' },
+      { type: 'text', text: 'Visible answer' },
+    ])
+    expect(
+      (normalized[0]!.message as unknown as Record<string, unknown>)
+        ._openai_response_items,
+    ).toBeUndefined()
+  })
 })

@@ -477,6 +477,65 @@ describe('withRetry', () => {
     expect(attempts).toBe(2)
   })
 
+  it('retries transient OpenAI-compatible rate limits', async () => {
+    let attempts = 0
+    const iterator = withRetry(
+      async () => ({}) as Anthropic,
+      async () => {
+        attempts++
+        if (attempts === 1) {
+          throw new OpenAICompatHTTPError(
+            429,
+            'Too Many Requests',
+            'Rate limit exceeded',
+            { headers: new Headers({ 'retry-after': '0' }) },
+          )
+        }
+        return 'ok'
+      },
+      {
+        maxRetries: 1,
+        model: 'gpt-test',
+        thinkingConfig: { type: 'adaptive' } satisfies ThinkingConfig,
+      },
+    )
+
+    expect(await iterator.next()).toEqual({ done: true, value: 'ok' })
+    expect(attempts).toBe(2)
+  })
+
+  it('does not retry terminal OpenAI-compatible quota errors', async () => {
+    let attempts = 0
+    const quotaError = new OpenAICompatHTTPError(
+      429,
+      'Too Many Requests',
+      'You exceeded your current quota',
+      { errorCode: 'insufficient_quota' },
+    )
+    const iterator = withRetry(
+      async () => ({}) as Anthropic,
+      async () => {
+        attempts++
+        throw quotaError
+      },
+      {
+        maxRetries: 2,
+        model: 'gpt-test',
+        thinkingConfig: { type: 'adaptive' } satisfies ThinkingConfig,
+      },
+    )
+
+    let caught: unknown
+    try {
+      await iterator.next()
+    } catch (error) {
+      caught = error
+    }
+    expect(caught).toBeInstanceOf(CannotRetryError)
+    expect((caught as CannotRetryError).originalError).toBe(quotaError)
+    expect(attempts).toBe(1)
+  })
+
   it('retries OpenAI-compatible transport failures', async () => {
     let attempts = 0
     const iterator = withRetry(

@@ -7,6 +7,7 @@ import { createHash, randomUUID } from 'crypto'
 import { parseSSEFrames } from '../../cli/transports/SSETransport.js'
 import { TOOL_SEARCH_TOOL_NAME } from '../../tools/ToolSearchTool/constants.js'
 import { errorMessage } from '../../utils/errors.js'
+import { modelSupportsOpenAIResponsesToolSearch } from '../../utils/model/providers.js'
 import type {
   InferenceClient,
   InferenceCountTokensArgs,
@@ -35,6 +36,7 @@ type OpenAIResponse = {
   model?: string
   status?: string
   incomplete_details?: { reason?: string } | null
+  error?: { code?: string; message?: string; type?: string } | null
   output?: ResponseItem[]
   usage?: ResponseUsage | null
 }
@@ -294,7 +296,11 @@ function toolSearchCallID(callID: string, names: string[]): string {
   return `ncode_tool_load_${digest}`
 }
 
-function convertMessages(messages: unknown, tools: unknown): ResponseItem[] {
+function convertMessages(
+  messages: unknown,
+  tools: unknown,
+  model: string,
+): ResponseItem[] {
   if (!Array.isArray(messages)) {
     throw new Error('Inference messages must be an array')
   }
@@ -302,11 +308,19 @@ function convertMessages(messages: unknown, tools: unknown): ResponseItem[] {
   const seenResponseItems = new Set<string>()
   const loadedToolNames = new Set<string>()
   const toolsByName = toolMap(tools)
+  const supportsToolSearch = modelSupportsOpenAIResponsesToolSearch(model)
   for (const message of messages) {
     if (!message || typeof message !== 'object' || !('role' in message)) continue
     const raw = (message as Record<string, unknown>)[OPENAI_RESPONSE_ITEMS_FIELD]
     if (Array.isArray(raw)) {
       for (const item of raw as ResponseItem[]) {
+        if (
+          !supportsToolSearch &&
+          (item.type === 'tool_search_call' ||
+            item.type === 'tool_search_output')
+        ) {
+          continue
+        }
         const key = responseItemKey(item)
         if (!seenResponseItems.has(key)) {
           seenResponseItems.add(key)
@@ -340,7 +354,7 @@ function convertMessages(messages: unknown, tools: unknown): ResponseItem[] {
           const names = toolReferenceNames(block.content).filter(
             name => !loadedToolNames.has(name),
           )
-          if (names.length > 0) {
+          if (supportsToolSearch && names.length > 0) {
             const searchCallID = toolSearchCallID(callID, names)
             input.push({
               type: 'tool_search_call',
@@ -471,16 +485,22 @@ function convertTools(tools: unknown): ResponseItem[] | undefined {
 export function buildOpenAIResponsesRequest(
   params: InferenceCreateMessageArgs[0],
 ) {
-  const effort =
+  const reasoning =
     params.thinking?.type === 'disabled'
-      ? 'none'
-      : ((params.output_config as { effort?: string } | undefined)?.effort ??
-        'high')
+      ? { effort: 'none' }
+      : params.thinking
+        ? {
+            effort:
+              (params.output_config as { effort?: string } | undefined)
+                ?.effort ?? 'high',
+            summary: 'auto',
+          }
+        : undefined
   const outputFormat = convertOutputFormat(params.output_config)
   const parallelToolCalls = convertParallelToolCalls(params.tool_choice)
   return {
     model: params.model,
-    input: convertMessages(params.messages, params.tools),
+    input: convertMessages(params.messages, params.tools, params.model),
     ...(systemText(params.system)
       ? { instructions: systemText(params.system) }
       : {}),
@@ -490,9 +510,11 @@ export function buildOpenAIResponsesRequest(
       ? { parallel_tool_calls: parallelToolCalls }
       : {}),
     max_output_tokens: params.max_tokens,
-    reasoning: { effort, summary: 'auto' },
+    ...(reasoning ? { reasoning } : {}),
     ...(outputFormat ? { text: { format: outputFormat } } : {}),
-    include: ['reasoning.encrypted_content'],
+    ...(reasoning && reasoning.effort !== 'none'
+      ? { include: ['reasoning.encrypted_content'] }
+      : {}),
     store: false,
     ...(params.stream ? { stream: true } : {}),
   }
@@ -514,6 +536,35 @@ function incompleteStopReason(
   }
 }
 
+function responseStatusDetail(response: OpenAIResponse): string {
+  const code = response.error?.code?.trim()
+  const type = response.error?.type?.trim()
+  const message = response.error?.message?.replace(/\s+/g, ' ').trim()
+  const label = [...new Set([code, type].filter(Boolean))].join('/')
+  return [label, message].filter(Boolean).join(': ').slice(0, 1000)
+}
+
+function assertTerminalResponse(response: OpenAIResponse): void {
+  if (response.status === 'completed' || response.status === 'incomplete') {
+    return
+  }
+  const detail = responseStatusDetail(response)
+  if (response.status === 'failed') {
+    throw new OpenAICompatTransportError(
+      `Responses API response failed${detail ? `: ${detail}` : ''}`,
+      response.error,
+    )
+  }
+  if (response.status === 'cancelled') {
+    throw new Error(
+      `Responses API response was cancelled${detail ? `: ${detail}` : ''}`,
+    )
+  }
+  throw new OpenAICompatTransportError(
+    `Responses API returned non-terminal status: ${String(response.status)}`,
+  )
+}
+
 function refusalText(response: OpenAIResponse): string {
   return (response.output ?? [])
     .flatMap(item =>
@@ -527,6 +578,7 @@ function refusalText(response: OpenAIResponse): string {
 }
 
 function messageFromResponse(response: OpenAIResponse): BetaMessage {
+  assertTerminalResponse(response)
   const content: Array<Record<string, unknown>> = []
   const refusal = refusalText(response)
   const incompleteReason = incompleteStopReason(response)
@@ -703,9 +755,15 @@ async function* streamEvents(
           const outputIndex = Number(event.output_index ?? items.length)
           const item = event.item as ResponseItem
           items[outputIndex] = item
-        } else if (type === 'response.completed' || type === 'response.incomplete') {
+        } else if (
+          type === 'response.completed' ||
+          type === 'response.incomplete' ||
+          type === 'response.failed' ||
+          type === 'response.cancelled'
+        ) {
           const r = event.response as OpenAIResponse
           terminalReceived = true
+          assertTerminalResponse(r)
           Object.assign(finalUsage, usage(r.usage))
           if (r.output?.length) {
             items.splice(0, items.length, ...r.output)
@@ -728,18 +786,18 @@ async function* streamEvents(
             }
           } else stopReason = incompleteStopReason(r) ?? stopReason
           break streamLoop
-        } else if (type === 'error' || type === 'response.failed') {
-          throw new Error(
+        } else if (type === 'error') {
+          terminalReceived = true
+          throw new OpenAICompatTransportError(
             `Responses API stream failed: ${JSON.stringify(event.error ?? event)}`,
+            event.error,
           )
         }
       }
       if (done) break
     }
   } finally {
-    if (terminalReceived || controller.signal.aborted) {
-      await reader.cancel().catch(() => {})
-    }
+    await reader.cancel().catch(() => {})
     reader.releaseLock()
   }
   if (!terminalReceived) {
@@ -789,6 +847,8 @@ function operation<T>(
 
 async function responseError(response: Response): Promise<OpenAICompatHTTPError> {
   let detail: string | undefined
+  let errorCode: string | undefined
+  let errorType: string | undefined
   try {
     const body = (await response.json()) as Record<string, unknown>
     const nested =
@@ -799,6 +859,8 @@ async function responseError(response: Response): Promise<OpenAICompatHTTPError>
     if (typeof candidate === 'string' && candidate.trim()) {
       detail = candidate.replace(/\s+/g, ' ').trim().slice(0, 1000)
     }
+    if (typeof nested?.code === 'string') errorCode = nested.code
+    if (typeof nested?.type === 'string') errorType = nested.type
   } catch {
     // Non-JSON error pages do not contain safe, structured API diagnostics.
   }
@@ -806,6 +868,7 @@ async function responseError(response: Response): Promise<OpenAICompatHTTPError>
     response.status,
     response.statusText,
     detail,
+    { headers: response.headers, errorCode, errorType },
   )
 }
 

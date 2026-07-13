@@ -57,11 +57,37 @@ class AnthropicInferenceClient implements InferenceClient {
     params: T,
   ): T {
     const messages = params.messages.map(message => {
+      const rawMessage = message as Record<string, unknown>
+      const hasResponsesMetadata = Object.hasOwn(
+        rawMessage,
+        '_openai_response_items',
+      )
       const {
         _openai_response_items: _ignored,
         ...anthropicMessage
-      } = message as Record<string, unknown>
-      return anthropicMessage
+      } = rawMessage
+      if (!hasResponsesMetadata || !Array.isArray(rawMessage.content)) {
+        return anthropicMessage
+      }
+      return {
+        ...anthropicMessage,
+        content: rawMessage.content.flatMap(block => {
+          if (!block || typeof block !== 'object' || !('type' in block)) {
+            return [block]
+          }
+          if (
+            block.type === 'thinking' &&
+            'thinking' in block &&
+            typeof block.thinking === 'string' &&
+            block.thinking.trim()
+          ) {
+            return [{ type: 'text', text: block.thinking }]
+          }
+          return block.type === 'thinking' || block.type === 'redacted_thinking'
+            ? []
+            : [block]
+        }),
+      }
     })
     return { ...params, messages } as T
   }

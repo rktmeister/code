@@ -275,7 +275,7 @@ describe('OpenAIResponsesInferenceClient', () => {
       },
     ]
     const request = buildOpenAIResponsesRequest({
-      model: 'gpt-test',
+      model: 'gpt-5.4',
       max_tokens: 10,
       messages: Array.from({ length: 4 }, () => ({
         role: 'assistant',
@@ -284,6 +284,71 @@ describe('OpenAIResponsesInferenceClient', () => {
       })),
     } as never)
     expect(request.input).toEqual(items)
+  })
+
+  it('does not replay tool-search items to an unsupported Responses model', () => {
+    const request = buildOpenAIResponsesRequest({
+      model: 'gpt-5.3',
+      max_tokens: 10,
+      messages: [
+        {
+          role: 'assistant',
+          content: [],
+          _openai_response_items: [
+            { type: 'reasoning', id: 'r1', encrypted_content: 'opaque' },
+            { type: 'tool_search_call', call_id: 'ts1', arguments: {} },
+            { type: 'tool_search_output', call_id: 'ts1', tools: [] },
+            {
+              type: 'message',
+              role: 'assistant',
+              content: [{ type: 'output_text', text: 'done' }],
+            },
+          ],
+        },
+      ],
+    } as never)
+
+    expect(request.input).toEqual([
+      { type: 'reasoning', id: 'r1', encrypted_content: 'opaque' },
+      {
+        type: 'message',
+        role: 'assistant',
+        content: [{ type: 'output_text', text: 'done' }],
+      },
+    ])
+  })
+
+  it('only sends reasoning configuration when thinking is enabled', () => {
+    const base = {
+      model: 'gpt-test',
+      max_tokens: 10,
+      messages: [{ role: 'user', content: 'hello' }],
+    }
+    const omitted = buildOpenAIResponsesRequest(base as never)
+    expect(omitted).not.toHaveProperty('reasoning')
+    expect(omitted).not.toHaveProperty('include')
+
+    const disabled = buildOpenAIResponsesRequest({
+      ...base,
+      thinking: { type: 'disabled' },
+      output_config: { effort: 'xhigh' },
+    } as never)
+    expect(disabled.reasoning).toEqual({ effort: 'none' })
+    expect(disabled).not.toHaveProperty('include')
+
+    const enabled = buildOpenAIResponsesRequest({
+      ...base,
+      thinking: { type: 'adaptive' },
+    } as never)
+    expect(enabled.reasoning).toEqual({ effort: 'high', summary: 'auto' })
+    expect(enabled.include).toEqual(['reasoning.encrypted_content'])
+
+    const explicit = buildOpenAIResponsesRequest({
+      ...base,
+      thinking: { type: 'adaptive' },
+      output_config: { effort: 'xhigh' },
+    } as never)
+    expect(explicit.reasoning).toEqual({ effort: 'xhigh', summary: 'auto' })
   })
 
   it('preserves structured output and tool-use constraints', () => {
@@ -397,11 +462,51 @@ describe('OpenAIResponsesInferenceClient', () => {
       model: 'gpt-test',
       max_tokens: 100,
       messages: [{ role: 'user', content: 'read' }],
+      thinking: { type: 'enabled', budget_tokens: 1024 },
     })
     expect(body).toMatchObject({ store: false, include: ['reasoning.encrypted_content'] })
     expect(result.content[0]).toMatchObject({ type: 'tool_use', id: 'call-1', name: 'Read' })
     expect(result.usage).toMatchObject({ input_tokens: 40, cache_read_input_tokens: 60, output_tokens: 10 })
     expect((result as unknown as Record<string, unknown>)._openai_response_items).toHaveLength(1)
+  })
+
+  it('rejects failed and cancelled unary responses', async () => {
+    const responses = [
+      {
+        id: 'resp-failed',
+        model: 'gpt-test',
+        status: 'failed',
+        error: {
+          code: 'server_error',
+          type: 'server_error',
+          message: 'Upstream inference failed',
+        },
+        output: [],
+      },
+      {
+        id: 'resp-cancelled',
+        model: 'gpt-test',
+        status: 'cancelled',
+        error: { code: 'cancelled', message: 'Request was cancelled' },
+        output: [],
+      },
+    ]
+    const client = new OpenAIResponsesInferenceClient({
+      baseURL: 'https://proxy.example.test/v1',
+      fetch: async () => Response.json(responses.shift()),
+    })
+    const params = {
+      model: 'gpt-test',
+      max_tokens: 10,
+      messages: [{ role: 'user', content: 'request' }],
+    } as const
+
+    expect(client.createMessage(params)).rejects.toThrow(
+      'server_error: Upstream inference failed',
+    )
+    expect(client.createMessage(params)).rejects.toThrow(
+      'Responses API response was cancelled: cancelled: Request was cancelled',
+    )
   })
 
   it('maps unary refusals to the downstream refusal contract', async () => {

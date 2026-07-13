@@ -56,7 +56,7 @@ OPENAI_MODEL=gpt-5.4 \
 .tmp/packages/ncode-0.1.0-linux-x64/ncode
 ```
 
-Direct key precedence is `NOUMENA_API_KEY`, then `ANTHROPIC_API_KEY`, then `OPENAI_API_KEY`. `OPENAI_BASE_URL`, `OPENAI_MODEL`, and `OPENAI_API_FORMAT` are only used when `OPENAI_API_KEY` is the active direct key. `OPENAI_API_FORMAT` defaults to `chat_completions`; set it to `responses` only when the endpoint supports `/v1/responses` and `/v1/responses/compact`. Project-checked-in settings cannot silently set OpenAI BYOK routing variables; keep provider keys in your shell, user settings, or a secret manager.
+Direct key precedence is `NOUMENA_API_KEY`, then `ANTHROPIC_API_KEY`, then `OPENAI_API_KEY`. `OPENAI_BASE_URL`, `OPENAI_MODEL`, and `OPENAI_API_FORMAT` are only used when `OPENAI_API_KEY` is the active direct key. `OPENAI_API_FORMAT` defaults to `chat_completions`; set it to `responses` only when the endpoint supports `/v1/responses` and `/v1/responses/input_tokens`. Conversation compaction uses the normal generation endpoint. Project-checked-in settings cannot silently set OpenAI BYOK routing variables; keep provider keys in your shell, user settings, or a secret manager.
 
 The launcher also reads `~/.config/noumena/ncode/api_key` by default. Service endpoints can be overridden for non-default infrastructure:
 

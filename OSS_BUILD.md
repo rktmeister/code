@@ -105,7 +105,7 @@ OPENAI_API_KEY=... OPENAI_BASE_URL=https://openrouter.ai/api/v1 OPENAI_MODEL=inc
 OPENAI_API_KEY=... OPENAI_BASE_URL=https://api.openai.com/v1 OPENAI_API_FORMAT=responses OPENAI_MODEL=gpt-5.4 .tmp/packages/ncode-0.1.0-linux-x64/ncode
 ```
 
-Direct key precedence is `NOUMENA_API_KEY`, then `ANTHROPIC_API_KEY`, then `OPENAI_API_KEY`. `OPENAI_API_FORMAT` defaults to `chat_completions`; use `responses` only with endpoints that support both Responses generation and compaction. Project settings cannot silently set OpenAI BYOK routing variables.
+Direct key precedence is `NOUMENA_API_KEY`, then `ANTHROPIC_API_KEY`, then `OPENAI_API_KEY`. `OPENAI_API_FORMAT` defaults to `chat_completions`; use `responses` only with endpoints that support `/v1/responses` and `/v1/responses/input_tokens`. Conversation compaction uses the normal generation endpoint. Project settings cannot silently set OpenAI BYOK routing variables.
 
 ## Run locally
 

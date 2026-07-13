@@ -121,6 +121,7 @@ function createAnthropicMessageFetchRecorder() {
         url: string
         method: string | undefined
         headers: Headers
+        body: Record<string, unknown>
       }
     | undefined
 
@@ -129,6 +130,7 @@ function createAnthropicMessageFetchRecorder() {
       url: input instanceof Request ? input.url : String(input),
       method: init?.method,
       headers: new Headers(init?.headers),
+      body: JSON.parse(String(init?.body)) as Record<string, unknown>,
     }
     return new Response(
       JSON.stringify({
@@ -296,6 +298,47 @@ describe('getInferenceClient', () => {
     expect(request.method).toBe('POST')
     expect(request.headers.get('authorization')).toBe('Bearer test-auth-token')
     expect(request.headers.get('x-api-key')).toBeNull()
+  })
+
+  it('removes opaque Responses state and converts its summaries at the Anthropic boundary', async () => {
+    process.env.NOUMENA_BASE_URL = 'https://api.noumena.com'
+    process.env.ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic'
+    delete process.env.ANTHROPIC_API_KEY
+    const recorder = createAnthropicMessageFetchRecorder()
+    const client = await getInferenceClient({
+      maxRetries: 0,
+      source: 'zai-anthropic',
+      fetchOverride: recorder.fetchOverride,
+    })
+
+    await client.createMessage({
+      model: 'glm-5.2[1m]',
+      max_tokens: 1,
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'Reasoning summary', signature: '' },
+            { type: 'text', text: 'Visible answer' },
+          ],
+          _openai_response_items: [
+            { type: 'reasoning', id: 'reasoning-1', encrypted_content: 'opaque' },
+          ],
+        },
+        { role: 'user', content: 'Continue' },
+      ],
+    } as never)
+
+    expect(recorder.getRequest().body.messages).toEqual([
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'Reasoning summary' },
+          { type: 'text', text: 'Visible answer' },
+        ],
+      },
+      { role: 'user', content: 'Continue' },
+    ])
   })
 
   it('recognizes trailing slash on the Z.ai Anthropic Messages endpoint', async () => {
