@@ -594,8 +594,8 @@ describe('withRetry', () => {
             'Internal Server Error',
             sensitiveDetail,
             {
-              errorCode: 'server_error',
-              errorType: 'server_error',
+              errorCode: '/private/repo/secret.ts',
+              errorType: 'https://internal.example.test/path',
               headers: new Headers({ 'retry-after': '0' }),
             },
           )
@@ -616,8 +616,9 @@ describe('withRetry', () => {
     expect(retryEvent).toBeDefined()
     expect(JSON.stringify(retryEvent)).not.toContain(sensitiveDetail)
     expect(retryEvent?.metadata.error).toBe(
-      'openai_compat_http_error status=500 code=server_error type=server_error',
+      'openai_compat_http_error status=500 code=unknown type=unknown',
     )
+    expect(JSON.stringify(retryEvent)).not.toContain('internal.example.test')
   })
 
   it('does not retry terminal Responses request errors', async () => {

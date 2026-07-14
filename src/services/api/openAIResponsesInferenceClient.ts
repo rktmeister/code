@@ -92,20 +92,29 @@ function systemText(system: unknown): string | undefined {
 function contentText(content: unknown, includeThinking = false): string {
   if (typeof content === 'string') return content
   if (!Array.isArray(content)) return String(content ?? '')
-  return content
-    .map(block => {
-      if (!block || typeof block !== 'object') return ''
-      if ('text' in block && typeof block.text === 'string') return block.text
-      if (
-        includeThinking &&
-        'thinking' in block &&
-        typeof block.thinking === 'string'
-      ) {
-        return block.thinking
-      }
-      return ''
-    })
-    .join('')
+  let result = ''
+  let previousKind: 'text' | 'thinking' | undefined
+  for (const block of content) {
+    if (!block || typeof block !== 'object') continue
+    const kind =
+      'text' in block && typeof block.text === 'string'
+        ? 'text'
+        : includeThinking &&
+            'thinking' in block &&
+            typeof block.thinking === 'string'
+          ? 'thinking'
+          : undefined
+    if (!kind) continue
+    const value = kind === 'text' ? block.text : block.thinking
+    if (result && previousKind && previousKind !== kind) {
+      const trailingNewlines = result.match(/\n*$/)?.[0].length ?? 0
+      const leadingNewlines = value.match(/^\n*/)?.[0].length ?? 0
+      result += '\n'.repeat(Math.max(0, 2 - trailingNewlines - leadingNewlines))
+    }
+    result += value
+    previousKind = kind
+  }
+  return result
 }
 
 function responseState(value: unknown): OpenAIResponseState | undefined {

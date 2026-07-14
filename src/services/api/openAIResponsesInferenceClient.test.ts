@@ -378,7 +378,7 @@ describe('OpenAIResponsesInferenceClient', () => {
         {
           role: 'assistant',
           content: [
-            { type: 'thinking', thinking: 'Reasoning summary. ', signature: '' },
+            { type: 'thinking', thinking: 'Reasoning summary.', signature: '' },
             { type: 'text', text: 'Visible answer.' },
             { type: 'tool_use', id: 'call-1', name: 'Read', input: { path: 'a.ts' } },
           ],
@@ -395,7 +395,7 @@ describe('OpenAIResponsesInferenceClient', () => {
       {
         type: 'message',
         role: 'assistant',
-        content: 'Reasoning summary. Visible answer.',
+        content: 'Reasoning summary.\n\nVisible answer.',
       },
       {
         type: 'function_call',
@@ -414,7 +414,7 @@ describe('OpenAIResponsesInferenceClient', () => {
         {
           role: 'assistant',
           content: [
-            { type: 'thinking', thinking: 'Legacy summary. ', signature: '' },
+            { type: 'thinking', thinking: 'Legacy summary.', signature: '' },
             { type: 'text', text: 'Visible answer.' },
           ],
           _openai_response_items: [
@@ -428,7 +428,7 @@ describe('OpenAIResponsesInferenceClient', () => {
       {
         type: 'message',
         role: 'assistant',
-        content: 'Legacy summary. Visible answer.',
+        content: 'Legacy summary.\n\nVisible answer.',
       },
     ])
   })
@@ -649,6 +649,15 @@ describe('OpenAIResponsesInferenceClient', () => {
     const cancelled = await client.createMessage(params).catch(error => error)
     expect(cancelled).toBeInstanceOf(OpenAIResponsesResponseError)
     expect(isOpenAIResponsesRetryableError(cancelled)).toBe(false)
+
+    const untrusted = new OpenAIResponsesResponseError(
+      '/private/repo/secret.ts',
+      'https://internal.example.test/path',
+      'Provider-controlled detail',
+    )
+    expect(untrusted.telemetryMessage).toBe(
+      'openai_responses_error code=unknown type=unknown',
+    )
   })
 
   it('maps unary refusals to the downstream refusal contract', async () => {

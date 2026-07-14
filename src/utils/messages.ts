@@ -2403,7 +2403,7 @@ function prepareResponsesMessagesForProtocol(messages: Message[]): Message[] {
       ? withoutScopedState
       : withoutLegacyState
     const content = Array.isArray(rawMessage.content)
-      ? rawMessage.content.flatMap(block => {
+      ? rawMessage.content.flatMap((block, index, blocks) => {
           if (!block || typeof block !== 'object' || !('type' in block)) {
             return [block]
           }
@@ -2413,7 +2413,20 @@ function prepareResponsesMessagesForProtocol(messages: Message[]): Message[] {
             typeof block.thinking === 'string' &&
             block.thinking.trim()
           ) {
-            return [{ type: 'text', text: block.thinking }]
+            const hasFollowingText = blocks.slice(index + 1).some(candidate =>
+              !!candidate &&
+              typeof candidate === 'object' &&
+              'type' in candidate &&
+              candidate.type === 'text' &&
+              'text' in candidate &&
+              typeof candidate.text === 'string' &&
+              candidate.text.length > 0,
+            )
+            const text =
+              hasLegacyState && !stripScopedState && hasFollowingText
+                ? appendParagraphBoundary(block.thinking)
+                : block.thinking
+            return [{ type: 'text', text }]
           }
           if (block.type === 'thinking' || block.type === 'redacted_thinking') {
             return []
@@ -2427,6 +2440,11 @@ function prepareResponsesMessagesForProtocol(messages: Message[]): Message[] {
       message: { ...preparedMessage, content },
     } as Message
   })
+}
+
+function appendParagraphBoundary(text: string): string {
+  const trailingNewlines = text.match(/\n*$/)?.[0].length ?? 0
+  return text + '\n'.repeat(Math.max(0, 2 - trailingNewlines))
 }
 
 export function mergeUserMessagesAndToolResults(

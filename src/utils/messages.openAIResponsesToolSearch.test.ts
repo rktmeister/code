@@ -241,7 +241,7 @@ describe('Responses tool-search message normalization', () => {
 
     expect(normalized).toHaveLength(1)
     expect(normalized[0]!.message.content).toEqual([
-      { type: 'text', text: 'Legacy summary' },
+      { type: 'text', text: 'Legacy summary\n\n' },
       { type: 'text', text: 'Visible answer' },
     ])
     const message = normalized[0]!.message as unknown as Record<string, unknown>

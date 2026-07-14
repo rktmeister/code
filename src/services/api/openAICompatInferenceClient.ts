@@ -64,16 +64,40 @@ export class OpenAICompatMalformedToolOutputError extends Error {
   }
 }
 
-function normalizeOpenAIErrorIdentifier(value: string | undefined): string {
-  if (!value) return 'unknown'
-  return (
-    value
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9._-]+/g, '_')
-      .replace(/^_+|_+$/g, '')
-      .slice(0, 100) || 'unknown'
-  )
+const OPENAI_TELEMETRY_ERROR_CODES = new Set([
+  'billing_hard_limit',
+  'billing_not_active',
+  'cancelled',
+  'content_filter',
+  'content_policy_violation',
+  'context_length_exceeded',
+  'insufficient_quota',
+  'invalid_api_key',
+  'invalid_prompt',
+  'model_not_found',
+  'quota_exceeded',
+  'rate_limit_exceeded',
+  'request_too_large',
+  'server_error',
+  'usage_limit_reached',
+])
+
+const OPENAI_TELEMETRY_ERROR_TYPES = new Set([
+  'authentication_error',
+  'billing_error',
+  'insufficient_quota',
+  'invalid_request_error',
+  'permission_error',
+  'rate_limit_error',
+  'server_error',
+])
+
+function telemetryOpenAIErrorIdentifier(
+  value: string | undefined,
+  allowlist: ReadonlySet<string>,
+): string {
+  const normalized = value?.trim().toLowerCase()
+  return normalized && allowlist.has(normalized) ? normalized : 'unknown'
 }
 
 export class OpenAICompatHTTPError extends TelemetrySafeError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS {
@@ -83,6 +107,8 @@ export class OpenAICompatHTTPError extends TelemetrySafeError_I_VERIFIED_THIS_IS
   readonly headers?: Headers
   readonly errorCode?: string
   readonly errorType?: string
+  readonly errorCodes: string[]
+  readonly errorTypes: string[]
 
   constructor(
     status: number,
@@ -92,10 +118,18 @@ export class OpenAICompatHTTPError extends TelemetrySafeError_I_VERIFIED_THIS_IS
       headers?: Headers
       errorCode?: string
       errorType?: string
+      errorCodes?: string[]
+      errorTypes?: string[]
     },
   ) {
-    const safeCode = normalizeOpenAIErrorIdentifier(metadata?.errorCode)
-    const safeType = normalizeOpenAIErrorIdentifier(metadata?.errorType)
+    const safeCode = telemetryOpenAIErrorIdentifier(
+      metadata?.errorCode,
+      OPENAI_TELEMETRY_ERROR_CODES,
+    )
+    const safeType = telemetryOpenAIErrorIdentifier(
+      metadata?.errorType,
+      OPENAI_TELEMETRY_ERROR_TYPES,
+    )
     super(
       `OpenAI compat inference request failed: ${status} ${statusText}${detail ? `: ${detail}` : ''}`,
       `openai_compat_http_error status=${status} code=${safeCode} type=${safeType}`,
@@ -107,6 +141,10 @@ export class OpenAICompatHTTPError extends TelemetrySafeError_I_VERIFIED_THIS_IS
     this.headers = metadata?.headers
     this.errorCode = metadata?.errorCode
     this.errorType = metadata?.errorType
+    this.errorCodes =
+      metadata?.errorCodes ?? [metadata?.errorCode].filter(isString)
+    this.errorTypes =
+      metadata?.errorTypes ?? [metadata?.errorType].filter(isString)
   }
 }
 
@@ -137,8 +175,14 @@ export class OpenAIResponsesResponseError extends TelemetrySafeError_I_VERIFIED_
     public readonly detail?: string,
   ) {
     const label = [...new Set([code, errorType].filter(Boolean))].join('/')
-    const safeCode = normalizeOpenAIErrorIdentifier(code)
-    const safeType = normalizeOpenAIErrorIdentifier(errorType)
+    const safeCode = telemetryOpenAIErrorIdentifier(
+      code,
+      OPENAI_TELEMETRY_ERROR_CODES,
+    )
+    const safeType = telemetryOpenAIErrorIdentifier(
+      errorType,
+      OPENAI_TELEMETRY_ERROR_TYPES,
+    )
     super(
       `OpenAI Responses request failed${label ? ` (${label})` : ''}${detail ? `: ${detail}` : ''}`,
       `openai_responses_error code=${safeCode} type=${safeType}`,
@@ -176,7 +220,8 @@ export function isOpenAICompatRetryableHTTPError(
 }
 
 function isTerminalQuotaError(error: OpenAICompatHTTPError): boolean {
-  const structured = `${error.errorCode ?? ''} ${error.errorType ?? ''}`
+  const structured = [...error.errorCodes, ...error.errorTypes]
+    .join(' ')
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
   if (
@@ -192,6 +237,7 @@ function isTerminalQuotaError(error: OpenAICompatHTTPError): boolean {
   const detail = error.detail?.toLowerCase() ?? ''
   return (
     detail.includes('insufficient quota') ||
+    detail.includes('exceeded your current quota') ||
     detail.includes('billing hard limit') ||
     detail.includes('billing is not active')
   )
@@ -221,6 +267,8 @@ export async function createOpenAICompatHTTPError(
   let detail: string | undefined
   let errorCode: string | undefined
   let errorType: string | undefined
+  let errorCodes: string[] = []
+  let errorTypes: string[] = []
   try {
     const body = (await response.json()) as Record<string, unknown>
     const nested =
@@ -231,10 +279,10 @@ export async function createOpenAICompatHTTPError(
     if (typeof candidate === 'string' && candidate.trim()) {
       detail = candidate.replace(/\s+/g, ' ').trim().slice(0, 1000)
     }
-    const code = nested?.code ?? body.code
-    const type = nested?.type ?? body.type
-    if (typeof code === 'string') errorCode = code
-    if (typeof type === 'string') errorType = type
+    errorCodes = [nested?.code, body.code].filter(isString)
+    errorTypes = [nested?.type, body.type].filter(isString)
+    errorCode = errorCodes[0]
+    errorType = errorTypes[0]
   } catch {
     // Non-JSON error pages do not contain safe, structured API diagnostics.
   }
@@ -242,8 +290,18 @@ export async function createOpenAICompatHTTPError(
     response.status,
     response.statusText,
     detail,
-    { headers: response.headers, errorCode, errorType },
+    {
+      headers: response.headers,
+      errorCode,
+      errorType,
+      errorCodes,
+      errorTypes,
+    },
   )
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string'
 }
 
 function getErrorCode(error: unknown): string | undefined {
