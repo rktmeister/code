@@ -21,6 +21,10 @@ import {
   enableConfigs,
 } from 'src/utils/config.js'
 import { getSecureStorage } from 'src/utils/secureStorage/index.js'
+import {
+  _resetForTesting as resetAnalyticsForTesting,
+  attachAnalyticsSink,
+} from '../analytics/index.js'
 import type { ThinkingConfig } from '../../utils/thinking.js'
 import {
   CannotRetryError,
@@ -231,6 +235,7 @@ beforeEach(() => {
   clearOAuthTokenCache()
   getSecureStorage().delete()
   _setGlobalConfigCacheForTesting(null)
+  resetAnalyticsForTesting()
 })
 
 afterEach(() => {
@@ -239,6 +244,7 @@ afterEach(() => {
   clearOAuthTokenCache()
   getSecureStorage().delete()
   _setGlobalConfigCacheForTesting(null)
+  resetAnalyticsForTesting()
   ;(globalThis as { MACRO?: unknown }).MACRO = originalMacro
 })
 
@@ -561,6 +567,57 @@ describe('withRetry', () => {
 
     expect(await iterator.next()).toEqual({ done: true, value: 'ok' })
     expect(attempts).toBe(2)
+  })
+
+  it('keeps provider error details out of retry analytics', async () => {
+    const events: Array<{
+      eventName: string
+      metadata: Record<string, unknown>
+    }> = []
+    attachAnalyticsSink({
+      logEvent: (eventName, metadata) => {
+        events.push({ eventName, metadata })
+      },
+      logEventAsync: async (eventName, metadata) => {
+        events.push({ eventName, metadata })
+      },
+    })
+    const sensitiveDetail = 'Invalid tool arguments from /private/repo/secret.ts'
+    let attempts = 0
+    const iterator = withRetry(
+      async () => ({}) as Anthropic,
+      async () => {
+        attempts++
+        if (attempts === 1) {
+          throw new OpenAICompatHTTPError(
+            500,
+            'Internal Server Error',
+            sensitiveDetail,
+            {
+              errorCode: 'server_error',
+              errorType: 'server_error',
+              headers: new Headers({ 'retry-after': '0' }),
+            },
+          )
+        }
+        return 'ok'
+      },
+      {
+        maxRetries: 1,
+        model: 'gpt-test',
+        thinkingConfig: { type: 'adaptive' } satisfies ThinkingConfig,
+      },
+    )
+
+    expect(await iterator.next()).toEqual({ done: true, value: 'ok' })
+    const retryEvent = events.find(
+      event => event.eventName === 'ncode_api_retry',
+    )
+    expect(retryEvent).toBeDefined()
+    expect(JSON.stringify(retryEvent)).not.toContain(sensitiveDetail)
+    expect(retryEvent?.metadata.error).toBe(
+      'openai_compat_http_error status=500 code=server_error type=server_error',
+    )
   })
 
   it('does not retry terminal Responses request errors', async () => {

@@ -20,7 +20,10 @@ import { logError } from 'src/utils/log.js'
 import { createSystemAPIErrorMessage } from 'src/utils/messages.js'
 import { getAPIProviderForStatsig } from 'src/utils/model/providers.js'
 import { isEnvTruthy } from '../../utils/envUtils.js'
-import { errorMessage } from '../../utils/errors.js'
+import {
+  errorMessage,
+  TelemetrySafeError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+} from '../../utils/errors.js'
 import {
   type CooldownReason,
   handleFastModeOverageRejection,
@@ -512,11 +515,15 @@ export async function* withRetry<T>(
       // In persistent mode the for-loop `attempt` is clamped at maxRetries+1;
       // use persistentAttempt for telemetry/yields so they show the true count.
       const reportedAttempt = persistent ? persistentAttempt : attempt
+      const analyticsError =
+        error instanceof TelemetrySafeError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
+          ? error.telemetryMessage
+          : errorMessage(error)
       logEvent('ncode_api_retry', {
         attempt: reportedAttempt,
         delayMs: delayMs,
-        error: (error as APIError)
-          .message as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        error:
+          analyticsError as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         status: (error as APIError).status,
         provider: getAPIProviderForStatsig(),
       })

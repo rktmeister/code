@@ -214,6 +214,41 @@ describe('Responses tool-search message normalization', () => {
     ).toEqual({ version: 1, scope: 'test-scope', items: responseItems })
   })
 
+  it('migrates legacy unscoped Responses state without replaying it', () => {
+    const normalized = normalizeMessagesForAPI([
+      {
+        type: 'assistant',
+        uuid: 'assistant-legacy',
+        timestamp: '2026-01-01T00:00:00.000Z',
+        message: {
+          id: 'response-legacy',
+          type: 'message',
+          role: 'assistant',
+          model: 'gpt-test',
+          stop_reason: 'end_turn',
+          stop_sequence: null,
+          usage: { input_tokens: 1, output_tokens: 1 },
+          content: [
+            { type: 'thinking', thinking: 'Legacy summary', signature: '' },
+            { type: 'text', text: 'Visible answer' },
+          ],
+          _openai_response_items: [
+            { type: 'reasoning', id: 'reasoning-1', encrypted_content: 'opaque' },
+          ],
+        },
+      },
+    ] as never)
+
+    expect(normalized).toHaveLength(1)
+    expect(normalized[0]!.message.content).toEqual([
+      { type: 'text', text: 'Legacy summary' },
+      { type: 'text', text: 'Visible answer' },
+    ])
+    const message = normalized[0]!.message as unknown as Record<string, unknown>
+    expect(message._openai_response_items).toBeUndefined()
+    expect(message._openai_response_state).toBeUndefined()
+  })
+
   it('converts Responses reasoning summaries to text for Anthropic', () => {
     delete process.env.OPENAI_API_KEY
     process.env.ANTHROPIC_API_KEY = 'test-key'

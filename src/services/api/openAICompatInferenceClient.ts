@@ -8,7 +8,10 @@ import {
 import { randomUUID } from 'crypto'
 import { parseSSEFrames } from '../../cli/transports/SSETransport.js'
 import { logForDebugging } from '../../utils/debug.js'
-import { errorMessage } from '../../utils/errors.js'
+import {
+  errorMessage,
+  TelemetrySafeError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+} from '../../utils/errors.js'
 import {
   getNCodeManagedModelBaseUrl,
   resolveNCodeManagedModel,
@@ -61,7 +64,19 @@ export class OpenAICompatMalformedToolOutputError extends Error {
   }
 }
 
-export class OpenAICompatHTTPError extends Error {
+function normalizeOpenAIErrorIdentifier(value: string | undefined): string {
+  if (!value) return 'unknown'
+  return (
+    value
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9._-]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .slice(0, 100) || 'unknown'
+  )
+}
+
+export class OpenAICompatHTTPError extends TelemetrySafeError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS {
   readonly status: number
   readonly statusText: string
   readonly detail?: string
@@ -79,8 +94,11 @@ export class OpenAICompatHTTPError extends Error {
       errorType?: string
     },
   ) {
+    const safeCode = normalizeOpenAIErrorIdentifier(metadata?.errorCode)
+    const safeType = normalizeOpenAIErrorIdentifier(metadata?.errorType)
     super(
       `OpenAI compat inference request failed: ${status} ${statusText}${detail ? `: ${detail}` : ''}`,
+      `openai_compat_http_error status=${status} code=${safeCode} type=${safeType}`,
     )
     this.name = 'OpenAICompatHTTPError'
     this.status = status
@@ -110,17 +128,20 @@ const RETRYABLE_OPENAI_RESPONSE_ERROR_CODES = new Set([
   'server_error',
 ])
 
-export class OpenAIResponsesResponseError extends Error {
+export class OpenAIResponsesResponseError extends TelemetrySafeError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS {
   readonly retryable: boolean
 
   constructor(
     public readonly code: string | undefined,
     public readonly errorType: string | undefined,
-    detail?: string,
+    public readonly detail?: string,
   ) {
     const label = [...new Set([code, errorType].filter(Boolean))].join('/')
+    const safeCode = normalizeOpenAIErrorIdentifier(code)
+    const safeType = normalizeOpenAIErrorIdentifier(errorType)
     super(
       `OpenAI Responses request failed${label ? ` (${label})` : ''}${detail ? `: ${detail}` : ''}`,
+      `openai_responses_error code=${safeCode} type=${safeType}`,
     )
     this.name = 'OpenAIResponsesResponseError'
     this.retryable =
@@ -210,8 +231,10 @@ export async function createOpenAICompatHTTPError(
     if (typeof candidate === 'string' && candidate.trim()) {
       detail = candidate.replace(/\s+/g, ' ').trim().slice(0, 1000)
     }
-    if (typeof nested?.code === 'string') errorCode = nested.code
-    if (typeof nested?.type === 'string') errorType = nested.type
+    const code = nested?.code ?? body.code
+    const type = nested?.type ?? body.type
+    if (typeof code === 'string') errorCode = code
+    if (typeof type === 'string') errorType = type
   } catch {
     // Non-JSON error pages do not contain safe, structured API diagnostics.
   }

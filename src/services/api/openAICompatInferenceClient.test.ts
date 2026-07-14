@@ -3100,6 +3100,37 @@ describe('OpenAICompatInferenceClient', () => {
     expect(isOpenAICompatRetryableHTTPError(caught)).toBe(false)
   })
 
+  it('classifies top-level structured quota errors as terminal', async () => {
+    const client = new OpenAICompatInferenceClient({
+      baseURL: 'http://example.test',
+      fetch: async () =>
+        Response.json(
+          {
+            message: 'You exceeded your current quota',
+            type: 'insufficient_quota',
+            code: 'insufficient_quota',
+          },
+          { status: 429, statusText: 'Too Many Requests' },
+        ),
+    })
+
+    const caught = await client
+      .createMessage({
+        model: 'test-model',
+        stream: false,
+        max_tokens: 8,
+        messages: [{ role: 'user', content: 'hello' }],
+      } as never)
+      .catch(error => error)
+
+    expect(caught).toMatchObject({
+      errorCode: 'insufficient_quota',
+      errorType: 'insufficient_quota',
+      detail: 'You exceeded your current quota',
+    })
+    expect(isOpenAICompatRetryableHTTPError(caught)).toBe(false)
+  })
+
   it('wraps fetch transport failures for retry classification', async () => {
     const cause = Object.assign(new Error('socket hang up'), {
       code: 'ECONNRESET',

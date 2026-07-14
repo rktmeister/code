@@ -406,6 +406,33 @@ describe('OpenAIResponsesInferenceClient', () => {
     ])
   })
 
+  it('never replays legacy unscoped state and preserves its readable content', () => {
+    const request = buildOpenAIResponsesRequest({
+      model: 'gpt-test',
+      max_tokens: 10,
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'Legacy summary. ', signature: '' },
+            { type: 'text', text: 'Visible answer.' },
+          ],
+          _openai_response_items: [
+            { type: 'reasoning', id: 'r1', encrypted_content: 'opaque' },
+          ],
+        },
+      ],
+    } as never)
+
+    expect(request.input).toEqual([
+      {
+        type: 'message',
+        role: 'assistant',
+        content: 'Legacy summary. Visible answer.',
+      },
+    ])
+  })
+
   it('only sends reasoning configuration when thinking is enabled', () => {
     const base = {
       model: 'gpt-test',
@@ -608,6 +635,12 @@ describe('OpenAIResponsesInferenceClient', () => {
     const serverError = await client.createMessage(params).catch(error => error)
     expect(serverError).toBeInstanceOf(OpenAIResponsesResponseError)
     expect(isOpenAIResponsesRetryableError(serverError)).toBe(true)
+    expect(
+      (serverError as OpenAIResponsesResponseError).telemetryMessage,
+    ).toBe('openai_responses_error code=server_error type=server_error')
+    expect(
+      (serverError as OpenAIResponsesResponseError).telemetryMessage,
+    ).not.toContain('Upstream inference failed')
 
     const invalidPrompt = await client.createMessage(params).catch(error => error)
     expect(invalidPrompt).toBeInstanceOf(OpenAIResponsesResponseError)

@@ -345,6 +345,47 @@ describe('getInferenceClient', () => {
     ])
   })
 
+  it('removes legacy Responses state at the Anthropic boundary', async () => {
+    process.env.NOUMENA_BASE_URL = 'https://api.noumena.com'
+    process.env.ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic'
+    delete process.env.ANTHROPIC_API_KEY
+    const recorder = createAnthropicMessageFetchRecorder()
+    const client = await getInferenceClient({
+      maxRetries: 0,
+      source: 'zai-anthropic',
+      fetchOverride: recorder.fetchOverride,
+    })
+
+    await client.createMessage({
+      model: 'glm-5.2[1m]',
+      max_tokens: 1,
+      messages: [
+        {
+          role: 'assistant',
+          content: [
+            { type: 'thinking', thinking: 'Legacy summary', signature: '' },
+            { type: 'text', text: 'Visible answer' },
+          ],
+          _openai_response_items: [
+            { type: 'reasoning', id: 'reasoning-1', encrypted_content: 'opaque' },
+          ],
+        },
+        { role: 'user', content: 'Continue' },
+      ],
+    } as never)
+
+    expect(recorder.getRequest().body.messages).toEqual([
+      {
+        role: 'assistant',
+        content: [
+          { type: 'text', text: 'Legacy summary' },
+          { type: 'text', text: 'Visible answer' },
+        ],
+      },
+      { role: 'user', content: 'Continue' },
+    ])
+  })
+
   it('recognizes trailing slash on the Z.ai Anthropic Messages endpoint', async () => {
     process.env.NOUMENA_BASE_URL = 'https://api.noumena.com'
     process.env.ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic/'

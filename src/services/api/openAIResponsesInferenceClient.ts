@@ -24,6 +24,7 @@ import {
 } from './openAICompatInferenceClient.js'
 
 export const OPENAI_RESPONSE_STATE_FIELD = '_openai_response_state'
+export const OPENAI_RESPONSE_LEGACY_ITEMS_FIELD = '_openai_response_items'
 
 type FetchLike = typeof fetch
 type ResponseItem = Record<string, unknown> & { type: string }
@@ -374,6 +375,10 @@ function convertMessages(
     const rawState = (message as Record<string, unknown>)[
       OPENAI_RESPONSE_STATE_FIELD
     ]
+    const hasLegacyState = Object.hasOwn(
+      message,
+      OPENAI_RESPONSE_LEGACY_ITEMS_FIELD,
+    )
     const state = responseState(rawState)
     const stateMatches =
       stateScope !== undefined && state?.scope === stateScope
@@ -461,7 +466,10 @@ function convertMessages(
       continue
     }
     if (role === 'assistant' && Array.isArray(content)) {
-      const text = contentText(content, rawState !== undefined && !stateMatches)
+      const text = contentText(
+        content,
+        hasLegacyState || (rawState !== undefined && !stateMatches),
+      )
       if (text) input.push({ type: 'message', role: 'assistant', content: text })
       for (const block of content) {
         if (block && typeof block === 'object' && block.type === 'tool_use') {

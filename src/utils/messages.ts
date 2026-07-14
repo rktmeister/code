@@ -2374,15 +2374,34 @@ export function normalizeMessagesForAPI(
 }
 
 function prepareResponsesMessagesForProtocol(messages: Message[]): Message[] {
-  if (getToolSearchProtocol() !== 'anthropic') return messages
+  const stripScopedState = getToolSearchProtocol() === 'anthropic'
 
   return messages.map(message => {
     if (message.type !== 'assistant') return message
     const rawMessage = message.message as unknown as Record<string, unknown>
-    if (!Object.hasOwn(rawMessage, '_openai_response_state')) return message
+    const hasScopedState = Object.hasOwn(
+      rawMessage,
+      '_openai_response_state',
+    )
+    const hasLegacyState = Object.hasOwn(
+      rawMessage,
+      '_openai_response_items',
+    )
+    if (!hasLegacyState && !(stripScopedState && hasScopedState)) {
+      return message
+    }
 
-    const { _openai_response_state: _ignored, ...withoutResponsesState } =
-      rawMessage
+    const {
+      _openai_response_items: _legacyIgnored,
+      ...withoutLegacyState
+    } = rawMessage
+    const {
+      _openai_response_state: _ignored,
+      ...withoutScopedState
+    } = withoutLegacyState
+    const preparedMessage = stripScopedState
+      ? withoutScopedState
+      : withoutLegacyState
     const content = Array.isArray(rawMessage.content)
       ? rawMessage.content.flatMap(block => {
           if (!block || typeof block !== 'object' || !('type' in block)) {
@@ -2405,7 +2424,7 @@ function prepareResponsesMessagesForProtocol(messages: Message[]): Message[] {
 
     return {
       ...message,
-      message: { ...withoutResponsesState, content },
+      message: { ...preparedMessage, content },
     } as Message
   })
 }
