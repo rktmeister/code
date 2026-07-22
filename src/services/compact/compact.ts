@@ -634,7 +634,6 @@ export async function compactConversation(
         isVisibleInTranscriptOnly: true,
       }),
     ]
-
     // Previously "postCompactTokenCount" — renamed because this is the
     // compact API call's total usage (input_tokens ≈ preCompactTokenCount),
     // NOT the size of the resulting context. Kept for event-field continuity.

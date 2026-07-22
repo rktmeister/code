@@ -12,6 +12,8 @@ import {
   getWrappedClientFetch,
 } from './client.js'
 import { OpenAICompatInferenceClient } from './openAICompatInferenceClient.js'
+import { OpenAIResponsesInferenceClient } from './openAIResponsesInferenceClient.js'
+import { getOpenAIApiFormat } from '../../utils/model/providers.js'
 import { getNCodeManagedModelBaseUrl } from '../../utils/model/ncodeModels.js'
 import { getDirectApiKeyEnvValue } from '../../utils/authEnv.js'
 import { getUserAgent } from '../../utils/http.js'
@@ -51,16 +53,63 @@ export interface InferenceClient {
 class AnthropicInferenceClient implements InferenceClient {
   constructor(private readonly anthropic: Anthropic) {}
 
+  private stripResponsesMetadata<T extends { messages: unknown[] }>(
+    params: T,
+  ): T {
+    const messages = params.messages.map(message => {
+      const rawMessage = message as Record<string, unknown>
+      const hasResponsesMetadata =
+        Object.hasOwn(rawMessage, '_openai_response_state') ||
+        Object.hasOwn(rawMessage, '_openai_response_items')
+      const {
+        _openai_response_state: _ignored,
+        _openai_response_items: _legacyIgnored,
+        ...anthropicMessage
+      } = rawMessage
+      if (!hasResponsesMetadata || !Array.isArray(rawMessage.content)) {
+        return anthropicMessage
+      }
+      return {
+        ...anthropicMessage,
+        content: rawMessage.content.flatMap(block => {
+          if (!block || typeof block !== 'object' || !('type' in block)) {
+            return [block]
+          }
+          if (
+            block.type === 'thinking' &&
+            'thinking' in block &&
+            typeof block.thinking === 'string' &&
+            block.thinking.trim()
+          ) {
+            return [{ type: 'text', text: block.thinking }]
+          }
+          return block.type === 'thinking' || block.type === 'redacted_thinking'
+            ? []
+            : [block]
+        }),
+      }
+    })
+    return { ...params, messages } as T
+  }
+
   createMessage(
     ...args: InferenceCreateMessageArgs
   ): InferenceCreateMessageResult {
-    return this.anthropic.beta.messages.create(...args)
+    const [params, options] = args
+    return this.anthropic.beta.messages.create(
+      this.stripResponsesMetadata(params),
+      options,
+    )
   }
 
   countTokens(
     ...args: InferenceCountTokensArgs
   ): InferenceCountTokensResult {
-    return this.anthropic.beta.messages.countTokens(...args)
+    const [params, options] = args
+    return this.anthropic.beta.messages.countTokens(
+      this.stripResponsesMetadata(params),
+      options,
+    )
   }
 
   listModels(...args: InferenceListModelsArgs): InferenceListModelsResult {
@@ -113,7 +162,11 @@ export async function getInferenceClient(
     const apiKey = getDirectApiKeyEnvValue()
     const baseURL = getOpenAICompatBaseUrl()
     if (apiKey && baseURL) {
-      return new OpenAICompatInferenceClient({
+      const Client =
+        getOpenAIApiFormat() === 'responses'
+          ? OpenAIResponsesInferenceClient
+          : OpenAICompatInferenceClient
+      return new Client({
         baseURL,
         headers: getOpenAICompatByokHeaders(apiKey),
         useNCodeManagedModelRouting: false,

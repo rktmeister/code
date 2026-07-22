@@ -8,7 +8,10 @@ import {
 import { randomUUID } from 'crypto'
 import { parseSSEFrames } from '../../cli/transports/SSETransport.js'
 import { logForDebugging } from '../../utils/debug.js'
-import { errorMessage } from '../../utils/errors.js'
+import {
+  errorMessage,
+  TelemetrySafeError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+} from '../../utils/errors.js'
 import {
   getNCodeManagedModelBaseUrl,
   resolveNCodeManagedModel,
@@ -61,15 +64,87 @@ export class OpenAICompatMalformedToolOutputError extends Error {
   }
 }
 
-export class OpenAICompatHTTPError extends Error {
+const OPENAI_TELEMETRY_ERROR_CODES = new Set([
+  'billing_hard_limit',
+  'billing_not_active',
+  'cancelled',
+  'content_filter',
+  'content_policy_violation',
+  'context_length_exceeded',
+  'insufficient_quota',
+  'invalid_api_key',
+  'invalid_prompt',
+  'model_not_found',
+  'quota_exceeded',
+  'rate_limit_exceeded',
+  'request_too_large',
+  'server_error',
+  'usage_limit_reached',
+])
+
+const OPENAI_TELEMETRY_ERROR_TYPES = new Set([
+  'authentication_error',
+  'billing_error',
+  'insufficient_quota',
+  'invalid_request_error',
+  'permission_error',
+  'rate_limit_error',
+  'server_error',
+])
+
+function telemetryOpenAIErrorIdentifier(
+  value: string | undefined,
+  allowlist: ReadonlySet<string>,
+): string {
+  const normalized = value?.trim().toLowerCase()
+  return normalized && allowlist.has(normalized) ? normalized : 'unknown'
+}
+
+export class OpenAICompatHTTPError extends TelemetrySafeError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS {
   readonly status: number
   readonly statusText: string
+  readonly detail?: string
+  readonly headers?: Headers
+  readonly errorCode?: string
+  readonly errorType?: string
+  readonly errorCodes: string[]
+  readonly errorTypes: string[]
 
-  constructor(status: number, statusText: string) {
-    super(`OpenAI compat inference request failed: ${status} ${statusText}`)
+  constructor(
+    status: number,
+    statusText: string,
+    detail?: string,
+    metadata?: {
+      headers?: Headers
+      errorCode?: string
+      errorType?: string
+      errorCodes?: string[]
+      errorTypes?: string[]
+    },
+  ) {
+    const safeCode = telemetryOpenAIErrorIdentifier(
+      metadata?.errorCode,
+      OPENAI_TELEMETRY_ERROR_CODES,
+    )
+    const safeType = telemetryOpenAIErrorIdentifier(
+      metadata?.errorType,
+      OPENAI_TELEMETRY_ERROR_TYPES,
+    )
+    super(
+      `OpenAI compat inference request failed: ${status} ${statusText}${detail ? `: ${detail}` : ''}`,
+      `openai_compat_http_error status=${status} code=${safeCode} type=${safeType}`,
+    )
     this.name = 'OpenAICompatHTTPError'
     this.status = status
     this.statusText = statusText
+    this.detail = detail
+    this.headers = metadata?.headers
+    this.errorCode = metadata?.errorCode
+    this.errorType = metadata?.errorType
+    this.errorCodes =
+      metadata?.errorCodes ?? [metadata?.errorCode].filter(isString)
+    this.errorTypes =
+      metadata?.errorTypes ?? [metadata?.errorType].filter(isString)
   }
 }
 
@@ -78,11 +153,44 @@ export class OpenAICompatTransportError extends Error {
 
   constructor(
     message: string,
-    public readonly originalError: unknown,
+    public readonly originalError: unknown = undefined,
   ) {
     super(`OpenAI compat inference transport failed: ${message}`)
     this.name = 'OpenAICompatTransportError'
     this.code = getErrorCode(originalError)
+  }
+}
+
+const RETRYABLE_OPENAI_RESPONSE_ERROR_CODES = new Set([
+  'rate_limit_exceeded',
+  'server_error',
+])
+
+export class OpenAIResponsesResponseError extends TelemetrySafeError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS {
+  readonly retryable: boolean
+
+  constructor(
+    public readonly code: string | undefined,
+    public readonly errorType: string | undefined,
+    public readonly detail?: string,
+  ) {
+    const label = [...new Set([code, errorType].filter(Boolean))].join('/')
+    const safeCode = telemetryOpenAIErrorIdentifier(
+      code,
+      OPENAI_TELEMETRY_ERROR_CODES,
+    )
+    const safeType = telemetryOpenAIErrorIdentifier(
+      errorType,
+      OPENAI_TELEMETRY_ERROR_TYPES,
+    )
+    super(
+      `OpenAI Responses request failed${label ? ` (${label})` : ''}${detail ? `: ${detail}` : ''}`,
+      `openai_responses_error code=${safeCode} type=${safeType}`,
+    )
+    this.name = 'OpenAIResponsesResponseError'
+    this.retryable =
+      typeof code === 'string' &&
+      RETRYABLE_OPENAI_RESPONSE_ERROR_CODES.has(code.toLowerCase())
   }
 }
 
@@ -101,13 +209,99 @@ export function isOpenAICompatMalformedToolOutputError(
 export function isOpenAICompatRetryableHTTPError(
   error: unknown,
 ): error is OpenAICompatHTTPError {
-  return error instanceof OpenAICompatHTTPError && error.status >= 500
+  if (!(error instanceof OpenAICompatHTTPError)) return false
+  if (error.status === 429 && isTerminalQuotaError(error)) return false
+  return (
+    error.status === 408 ||
+    error.status === 409 ||
+    error.status === 429 ||
+    error.status >= 500
+  )
+}
+
+function isTerminalQuotaError(error: OpenAICompatHTTPError): boolean {
+  const structured = [...error.errorCodes, ...error.errorTypes]
+    .join(' ')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+  if (
+    structured.includes('insufficient_quota') ||
+    structured.includes('billing_hard_limit') ||
+    structured.includes('billing_not_active') ||
+    structured.includes('usage_limit_reached') ||
+    structured.includes('quota_exceeded')
+  ) {
+    return true
+  }
+
+  const detail = error.detail?.toLowerCase() ?? ''
+  return (
+    detail.includes('insufficient quota') ||
+    detail.includes('exceeded your current quota') ||
+    detail.includes('billing hard limit') ||
+    detail.includes('billing is not active')
+  )
 }
 
 export function isOpenAICompatRetryableTransportError(
   error: unknown,
 ): error is OpenAICompatTransportError {
   return error instanceof OpenAICompatTransportError
+}
+
+export function isOpenAIResponsesResponseError(
+  error: unknown,
+): error is OpenAIResponsesResponseError {
+  return error instanceof OpenAIResponsesResponseError
+}
+
+export function isOpenAIResponsesRetryableError(
+  error: unknown,
+): error is OpenAIResponsesResponseError {
+  return error instanceof OpenAIResponsesResponseError && error.retryable
+}
+
+export async function createOpenAICompatHTTPError(
+  response: Response,
+): Promise<OpenAICompatHTTPError> {
+  let detail: string | undefined
+  let errorCode: string | undefined
+  let errorType: string | undefined
+  let errorCodes: string[] = []
+  let errorTypes: string[] = []
+  try {
+    const body = (await response.json()) as Record<string, unknown>
+    const nested =
+      body.error && typeof body.error === 'object'
+        ? (body.error as Record<string, unknown>)
+        : undefined
+    const candidate = nested?.message ?? body.message ?? body.detail
+    if (typeof candidate === 'string' && candidate.trim()) {
+      detail = candidate.replace(/\s+/g, ' ').trim().slice(0, 1000)
+    }
+    errorCodes = [nested?.code, body.code].filter(isString)
+    errorTypes = [nested?.type, body.type].filter(isString)
+    errorCode = errorCodes[0]
+    errorType = errorTypes[0]
+  } catch {
+    // Non-JSON error pages do not contain safe, structured API diagnostics.
+  }
+  return new OpenAICompatHTTPError(
+    response.status,
+    response.statusText,
+    detail,
+    {
+      headers: response.headers,
+      errorCode,
+      errorType,
+      errorCodes,
+      errorTypes,
+    },
+  )
+}
+
+function isString(value: unknown): value is string {
+  return typeof value === 'string'
 }
 
 function getErrorCode(error: unknown): string | undefined {
@@ -1753,7 +1947,7 @@ export class OpenAICompatInferenceClient implements InferenceClient {
 
     const operation = createInferenceOperation(responsePromise, async response => {
       if (!response.ok) {
-        throw new OpenAICompatHTTPError(response.status, response.statusText)
+        throw await createOpenAICompatHTTPError(response)
       }
       if (params.stream) {
         const controller = new AbortController()

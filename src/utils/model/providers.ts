@@ -8,6 +8,7 @@ import { isEnvTruthy } from '../envUtils.js'
 export type APIProvider = 'firstParty' | 'bedrock' | 'vertex' | 'foundry'
 export const OPENAI_COMPAT_DEFAULT_BASE_URL = 'https://api.openai.com'
 export const OPENAI_COMPAT_DEFAULT_MODEL = 'gpt-5.1-codex'
+export type OpenAIApiFormat = 'chat_completions' | 'responses'
 
 const FIRST_PARTY_NOUMENA_HOSTS = [
   'api.noumena.com',
@@ -45,6 +46,32 @@ export function getOpenAICompatBaseUrl(): string | undefined {
 
 export function getOpenAICompatDefaultModel(): string {
   return normalizeEnvValue(process.env.OPENAI_MODEL) ?? OPENAI_COMPAT_DEFAULT_MODEL
+}
+
+export function getOpenAIApiFormat(): OpenAIApiFormat {
+  const value = normalizeEnvValue(process.env.OPENAI_API_FORMAT)?.toLowerCase()
+  if (!value || value === 'chat_completions') return 'chat_completions'
+  if (value === 'responses') return 'responses'
+  throw new Error(
+    `Invalid OPENAI_API_FORMAT ${JSON.stringify(value)}. Expected "chat_completions" or "responses".`,
+  )
+}
+
+export function isOpenAIResponsesActive(): boolean {
+  return isOpenAICompatByokActive() && getOpenAIApiFormat() === 'responses'
+}
+
+/** OpenAI Responses tool search is available on GPT-5.4 and later models. */
+export function modelSupportsOpenAIResponsesToolSearch(model: string): boolean {
+  const match = model
+    .trim()
+    .toLowerCase()
+    .match(/(?:^|[/:])gpt-(\d+)(?:\.(\d+))?/)
+  if (!match) return false
+
+  const major = Number(match[1])
+  const minor = Number(match[2] ?? 0)
+  return major > 5 || (major === 5 && minor >= 4)
 }
 
 export function getFirstPartyBaseUrlOverride(): string | undefined {

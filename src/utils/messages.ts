@@ -170,6 +170,7 @@ function getTeammateMailbox(): typeof import('./teammateMailbox.js') {
 }
 
 import {
+  getToolSearchProtocol,
   isToolReferenceBlock,
   isToolSearchEnabledOptimistic,
 } from './toolSearch.js'
@@ -1996,8 +1997,10 @@ export function normalizeMessagesForAPI(
   // First, reorder attachments to bubble up until they hit a tool result or assistant message
   // Then strip virtual messages — they're display-only (e.g. REPL inner tool
   // calls) and must never reach the API.
-  const reorderedMessages = reorderAttachmentsForAPI(messages).filter(
-    m => !((m.type === 'user' || m.type === 'assistant') && m.isVirtual),
+  const reorderedMessages = prepareResponsesMessagesForProtocol(
+    reorderAttachmentsForAPI(messages).filter(
+      m => !((m.type === 'user' || m.type === 'assistant') && m.isVirtual),
+    ),
   )
 
   // Build a map from error text → which block types to strip from the preceding user message.
@@ -2157,6 +2160,7 @@ export function normalizeMessagesForAPI(
           // that gets relocated, so skipping it saves a scan. When gate is
           // off, this is the fallback (same as pre-#21049 main).
           if (
+            getToolSearchProtocol() === 'anthropic' &&
             !checkStatsigFeatureGate_CACHED_MAY_BE_STALE(
               'ncode_toolref_defer_j8m',
             )
@@ -2298,11 +2302,11 @@ export function normalizeMessagesForAPI(
   // Runs after merge (siblings are in place) and before ID tagging (so
   // tags reflect final positions). When gate is OFF, this is a noop and
   // the TOOL_REFERENCE_TURN_BOUNDARY injection above serves as fallback.
-  const relocated = checkStatsigFeatureGate_CACHED_MAY_BE_STALE(
-    'ncode_toolref_defer_j8m',
-  )
-    ? relocateToolReferenceSiblings(result)
-    : result
+  const relocated =
+    getToolSearchProtocol() === 'anthropic' &&
+    checkStatsigFeatureGate_CACHED_MAY_BE_STALE('ncode_toolref_defer_j8m')
+      ? relocateToolReferenceSiblings(result)
+      : result
 
   // Filter orphaned thinking-only assistant messages (likely introduced by
   // compaction slicing away intervening messages between a failed streaming
@@ -2369,6 +2373,80 @@ export function normalizeMessagesForAPI(
   return sanitized
 }
 
+function prepareResponsesMessagesForProtocol(messages: Message[]): Message[] {
+  const stripScopedState = getToolSearchProtocol() === 'anthropic'
+
+  return messages.map(message => {
+    if (message.type !== 'assistant') return message
+    const rawMessage = message.message as unknown as Record<string, unknown>
+    const hasScopedState = Object.hasOwn(
+      rawMessage,
+      '_openai_response_state',
+    )
+    const hasLegacyState = Object.hasOwn(
+      rawMessage,
+      '_openai_response_items',
+    )
+    if (!hasLegacyState && !(stripScopedState && hasScopedState)) {
+      return message
+    }
+
+    const {
+      _openai_response_items: _legacyIgnored,
+      ...withoutLegacyState
+    } = rawMessage
+    const {
+      _openai_response_state: _ignored,
+      ...withoutScopedState
+    } = withoutLegacyState
+    const preparedMessage = stripScopedState
+      ? withoutScopedState
+      : withoutLegacyState
+    const content = Array.isArray(rawMessage.content)
+      ? rawMessage.content.flatMap((block, index, blocks) => {
+          if (!block || typeof block !== 'object' || !('type' in block)) {
+            return [block]
+          }
+          if (
+            block.type === 'thinking' &&
+            'thinking' in block &&
+            typeof block.thinking === 'string' &&
+            block.thinking.trim()
+          ) {
+            const hasFollowingText = blocks.slice(index + 1).some(candidate =>
+              !!candidate &&
+              typeof candidate === 'object' &&
+              'type' in candidate &&
+              candidate.type === 'text' &&
+              'text' in candidate &&
+              typeof candidate.text === 'string' &&
+              candidate.text.length > 0,
+            )
+            const text =
+              hasLegacyState && !stripScopedState && hasFollowingText
+                ? appendParagraphBoundary(block.thinking)
+                : block.thinking
+            return [{ type: 'text', text }]
+          }
+          if (block.type === 'thinking' || block.type === 'redacted_thinking') {
+            return []
+          }
+          return [block]
+        })
+      : rawMessage.content
+
+    return {
+      ...message,
+      message: { ...preparedMessage, content },
+    } as Message
+  })
+}
+
+function appendParagraphBoundary(text: string): string {
+  const trailingNewlines = text.match(/\n*$/)?.[0].length ?? 0
+  return text + '\n'.repeat(Math.max(0, 2 - trailingNewlines))
+}
+
 export function mergeUserMessagesAndToolResults(
   a: UserMessage,
   b: UserMessage,
@@ -2390,11 +2468,31 @@ export function mergeAssistantMessages(
   a: AssistantMessage,
   b: AssistantMessage,
 ): AssistantMessage {
+  const aResponseState = (
+    a.message as unknown as Record<string, unknown>
+  )._openai_response_state
+  const bResponseState = (
+    b.message as unknown as Record<string, unknown>
+  )._openai_response_state
+  const bResponseItems =
+    bResponseState &&
+    typeof bResponseState === 'object' &&
+    'items' in bResponseState &&
+    Array.isArray(bResponseState.items)
+      ? bResponseState.items
+      : undefined
+  const responseState =
+    bResponseItems && bResponseItems.length > 0
+      ? bResponseState
+      : aResponseState
   return {
     ...a,
     message: {
       ...a.message,
       content: [...a.message.content, ...b.message.content],
+      ...(responseState && typeof responseState === 'object'
+        ? { _openai_response_state: responseState }
+        : {}),
     },
   }
 }
@@ -5132,6 +5230,20 @@ export function filterOrphanedThinkingOnlyMessages(
 
     if (!allThinking) {
       return true // Has non-thinking content, keep it
+    }
+
+    const responseState = (
+      msg.message as unknown as Record<string, unknown>
+    )._openai_response_state
+    const responseItems =
+      responseState &&
+      typeof responseState === 'object' &&
+      'items' in responseState &&
+      Array.isArray(responseState.items)
+        ? responseState.items
+        : undefined
+    if (responseItems && responseItems.length > 0) {
+      return true
     }
 
     // It's thinking-only. Keep it if there's another message with same id

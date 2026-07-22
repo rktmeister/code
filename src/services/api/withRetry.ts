@@ -20,7 +20,10 @@ import { logError } from 'src/utils/log.js'
 import { createSystemAPIErrorMessage } from 'src/utils/messages.js'
 import { getAPIProviderForStatsig } from 'src/utils/model/providers.js'
 import { isEnvTruthy } from '../../utils/envUtils.js'
-import { errorMessage } from '../../utils/errors.js'
+import {
+  errorMessage,
+  TelemetrySafeError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+} from '../../utils/errors.js'
 import {
   type CooldownReason,
   handleFastModeOverageRejection,
@@ -49,6 +52,7 @@ import {
   isOpenAICompatBackendAbortError,
   isOpenAICompatRetryableHTTPError,
   isOpenAICompatRetryableTransportError,
+  isOpenAIResponsesRetryableError,
 } from './openAICompatInferenceClient.js'
 
 const abortError = () => new APIUserAbortError()
@@ -414,11 +418,14 @@ export async function* withRetry<T>(
         isOpenAICompatRetryableHTTPError(error)
       const retryableOpenAICompatTransport =
         isOpenAICompatRetryableTransportError(error)
+      const retryableOpenAIResponses =
+        isOpenAIResponsesRetryableError(error)
       if (
         !handledCloudAuthError &&
         !retryableOpenAICompatAbort &&
         !retryableOpenAICompatHTTP &&
         !retryableOpenAICompatTransport &&
+        !retryableOpenAIResponses &&
         (!(error instanceof APIError) || !shouldRetry(error))
       ) {
         throw new CannotRetryError(error, retryContext)
@@ -508,11 +515,15 @@ export async function* withRetry<T>(
       // In persistent mode the for-loop `attempt` is clamped at maxRetries+1;
       // use persistentAttempt for telemetry/yields so they show the true count.
       const reportedAttempt = persistent ? persistentAttempt : attempt
+      const analyticsError =
+        error instanceof TelemetrySafeError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
+          ? error.telemetryMessage
+          : errorMessage(error)
       logEvent('ncode_api_retry', {
         attempt: reportedAttempt,
         delayMs: delayMs,
-        error: (error as APIError)
-          .message as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        error:
+          analyticsError as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
         status: (error as APIError).status,
         provider: getAPIProviderForStatsig(),
       })
@@ -557,6 +568,74 @@ export async function* withRetry<T>(
   }
 
   throw new CannotRetryError(lastError, retryContext)
+}
+
+type StreamFactory<T> = (
+  attempt: number,
+) => AsyncGenerator<SystemAPIErrorMessage, AsyncIterable<T>>
+
+export type StreamRetryEvent<T> =
+  | { type: 'attempt_start'; attempt: number }
+  | { type: 'event'; attempt: number; event: T }
+  | { type: 'system'; message: SystemAPIErrorMessage }
+
+/**
+ * Retries Responses failures that arrive while consuming an SSE stream.
+ * Request-opening retries remain owned by `withRetry`; this wrapper covers the
+ * distinct failure boundary after response headers have already been accepted.
+ */
+export async function* withOpenAIResponsesStreamRetry<T>(
+  createStream: StreamFactory<T>,
+  options: {
+    maxRetries?: number
+    signal?: AbortSignal
+    canRetry: () => boolean
+    onRetry?: (error: unknown, attempt: number, delayMs: number) => void
+  },
+): AsyncGenerator<StreamRetryEvent<T>, void> {
+  const maxRetries = options.maxRetries ?? getDefaultMaxRetries()
+
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    if (options.signal?.aborted) throw new APIUserAbortError()
+
+    try {
+      const factory = createStream(attempt)
+      let result = await factory.next()
+      while (!result.done) {
+        yield { type: 'system', message: result.value }
+        result = await factory.next()
+      }
+
+      yield { type: 'attempt_start', attempt }
+      for await (const event of result.value) {
+        yield { type: 'event', attempt, event }
+      }
+      return
+    } catch (error) {
+      if (
+        !isOpenAIResponsesRetryableError(error) ||
+        !options.canRetry() ||
+        attempt > maxRetries
+      ) {
+        throw error
+      }
+
+      const delayMs = getRetryDelay(attempt)
+      const analyticsError =
+        error instanceof TelemetrySafeError_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS
+          ? error.telemetryMessage
+          : errorMessage(error)
+      logEvent('ncode_api_retry', {
+        attempt,
+        delayMs,
+        error:
+          analyticsError as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
+        provider: getAPIProviderForStatsig(),
+      })
+      options.onRetry?.(error, attempt, delayMs)
+      await sleep(delayMs, options.signal, { abortError })
+    }
+  }
 }
 
 function getRetryAfter(error: unknown): string | null {

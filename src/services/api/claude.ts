@@ -103,6 +103,7 @@ import {
   getCurrentOauthBackedInferenceAccountUuid,
   getCurrentOauthBackedFirstPartyInferenceSession,
 } from './firstPartyInferenceSession.js'
+import { isOpenAIResponsesResponseError } from './openAICompatInferenceClient.js'
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const autoModeStateModule = feature('TRANSCRIPT_CLASSIFIER')
@@ -187,6 +188,7 @@ import {
 } from 'src/utils/thinking.js'
 import {
   extractDiscoveredToolNames,
+  getToolSearchProtocol,
   isDeferredToolsDeltaEnabled,
   isToolSearchEnabled,
 } from 'src/utils/toolSearch.js'
@@ -258,6 +260,7 @@ import {
   is529Error,
   type RetryContext,
   withRetry,
+  withOpenAIResponsesStreamRetry,
 } from './withRetry.js'
 
 // Define a type that represents valid JSON values
@@ -618,6 +621,11 @@ export function userMessageToMessageParam(
   enablePromptCaching: boolean,
   querySource?: QuerySource,
 ): MessageParam {
+  const responseState = (
+    message.message as unknown as Record<string, unknown>
+  )._openai_response_state
+  const hasResponseState =
+    !!responseState && typeof responseState === 'object'
   if (addCache) {
     if (typeof message.message.content === 'string') {
       return {
@@ -631,7 +639,10 @@ export function userMessageToMessageParam(
             }),
           },
         ],
-      }
+        ...(hasResponseState
+          ? { _openai_response_state: responseState }
+          : {}),
+      } as MessageParam
     } else {
       return {
         role: 'user',
@@ -643,7 +654,10 @@ export function userMessageToMessageParam(
               : {}
             : {}),
         })),
-      }
+        ...(hasResponseState
+          ? { _openai_response_state: responseState }
+          : {}),
+      } as MessageParam
     }
   }
   // Clone array content to prevent in-place mutations (e.g., insertCacheEditsBlock's
@@ -654,7 +668,10 @@ export function userMessageToMessageParam(
     content: Array.isArray(message.message.content)
       ? [...message.message.content]
       : message.message.content,
-  }
+    ...(hasResponseState
+      ? { _openai_response_state: responseState }
+      : {}),
+  } as MessageParam
 }
 
 export function assistantMessageToMessageParam(
@@ -663,6 +680,11 @@ export function assistantMessageToMessageParam(
   enablePromptCaching: boolean,
   querySource?: QuerySource,
 ): MessageParam {
+  const responseState = (
+    message.message as unknown as Record<string, unknown>
+  )._openai_response_state
+  const hasResponseState =
+    !!responseState && typeof responseState === 'object'
   if (addCache) {
     if (typeof message.message.content === 'string') {
       return {
@@ -676,7 +698,10 @@ export function assistantMessageToMessageParam(
             }),
           },
         ],
-      }
+        ...(hasResponseState
+          ? { _openai_response_state: responseState }
+          : {}),
+      } as MessageParam
     } else {
       return {
         role: 'assistant',
@@ -691,13 +716,19 @@ export function assistantMessageToMessageParam(
               : {}
             : {}),
         })),
-      }
+        ...(hasResponseState
+          ? { _openai_response_state: responseState }
+          : {}),
+      } as MessageParam
     }
   }
   return {
     role: 'assistant',
     content: message.message.content,
-  }
+    ...(hasResponseState
+      ? { _openai_response_state: responseState }
+      : {}),
+  } as MessageParam
 }
 
 export type Options = {
@@ -1142,6 +1173,8 @@ async function* queryModel(
     }
   }
 
+  const toolSearchProtocol = getToolSearchProtocol()
+
   // Check if tool search is enabled (checks mode, model support, and threshold for auto mode)
   // This is async because it may need to calculate MCP tool description sizes for TstAuto mode
   let useToolSearch = await isToolSearchEnabled(
@@ -1174,11 +1207,18 @@ async function* queryModel(
     useToolSearch = false
   }
 
-  // Filter out ToolSearchTool if tool search is not enabled for this model
-  // ToolSearchTool returns tool_reference blocks which unsupported models can't handle
+  const useOpenAIResponsesToolSearch =
+    useToolSearch && toolSearchProtocol === 'openai-responses'
+
+  // Choose the tool inventory required by the active search protocol.
   let filteredTools: Tools
 
-  if (useToolSearch) {
+  if (useOpenAIResponsesToolSearch) {
+    // Keep the complete local inventory so the Responses adapter can turn
+    // ToolSearch results into client tool-search records containing the
+    // selected schemas. Deferred definitions stay out of the top-level list.
+    filteredTools = tools
+  } else if (useToolSearch) {
     // Dynamic tool loading: Only include deferred tools that have been discovered
     // via tool_reference blocks in the message history. This eliminates the need
     // to predeclare all deferred tools upfront and removes limits on tool quantity.
@@ -1198,10 +1238,13 @@ async function* queryModel(
     )
   }
 
-  // Add tool search beta header if enabled - required for defer_loading to be accepted
+  // Anthropic transports require a beta header for defer_loading.
   // Header differs by provider: 1P/Foundry use advanced-tool-use, Vertex/Bedrock use tool-search-tool
   // For Bedrock, this header must go in extraBodyParams, not the betas array
-  const toolSearchHeader = useToolSearch ? getToolSearchBetaHeader() : null
+  const toolSearchHeader =
+    useToolSearch && !useOpenAIResponsesToolSearch
+      ? getToolSearchBetaHeader()
+      : null
   if (toolSearchHeader && getAPIProvider() !== 'bedrock') {
     if (!betas.includes(toolSearchHeader)) {
       betas.push(toolSearchHeader)
@@ -1290,7 +1333,18 @@ async function* queryModel(
   })
 
   queryCheckpoint('query_message_normalization_start')
-  let messagesForAPI = normalizeMessagesForAPI(messages, filteredTools)
+  const messagesForNormalization =
+    toolSearchProtocol === 'openai-responses'
+      ? messages.filter(
+          message =>
+            message.type !== 'attachment' ||
+            message.attachment.type !== 'deferred_tools_delta',
+        )
+      : messages
+  let messagesForAPI = normalizeMessagesForAPI(
+    messagesForNormalization,
+    filteredTools,
+  )
   queryCheckpoint('query_message_normalization_end')
 
   // Model-specific post-processing: strip tool-search-specific fields if the
@@ -1354,7 +1408,11 @@ async function* queryModel(
   // When the delta attachment is enabled, deferred tools are announced
   // via persisted deferred_tools_delta attachments instead of this
   // ephemeral prepend (which busts cache whenever the pool changes).
-  if (useToolSearch && !isDeferredToolsDeltaEnabled()) {
+  if (
+    useToolSearch &&
+    !useOpenAIResponsesToolSearch &&
+    !isDeferredToolsDeltaEnabled()
+  ) {
     const deferredToolList = tools
       .filter(t => deferredToolNames.has(t.name))
       .map(formatDeferredToolLine)
@@ -1379,7 +1437,10 @@ async function* queryModel(
     isToolFromMcpServer(t.name, CLAUDE_IN_CHROME_MCP_SERVER_NAME),
   )
   const injectChromeHere =
-    useToolSearch && hasChromeTools && !isMcpInstructionsDeltaEnabled()
+    useToolSearch &&
+    !useOpenAIResponsesToolSearch &&
+    hasChromeTools &&
+    !isMcpInstructionsDeltaEnabled()
 
   // filter(Boolean) works by converting each element to a boolean - empty strings become false and are filtered out.
   systemPrompt = asSystemPrompt(
@@ -1623,7 +1684,9 @@ async function* queryModel(
     const hasThinking =
       thinkingConfig.type !== 'disabled' &&
       !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_THINKING)
-    let thinking: BetaMessageStreamParams['thinking'] | undefined = undefined
+    let thinking: BetaMessageStreamParams['thinking'] | undefined = hasThinking
+      ? undefined
+      : { type: 'disabled' }
 
     // IMPORTANT: Do not change the adaptive-vs-budget thinking selection below
     // without notifying the model launch DRI and research. This is a sensitive
@@ -1801,96 +1864,99 @@ async function* queryModel(
   let isAdvisorInProgress = false
 
   try {
-    queryCheckpoint('query_client_creation_start')
-    const generator = withRetry(
-      () =>
-        getInferenceClient({
-          maxRetries: 0, // Disabled auto-retry in favor of manual implementation
+    async function* createStreamingAttempt(): AsyncGenerator<
+      SystemAPIErrorMessage,
+      Stream<BetaRawMessageStreamEvent>
+    > {
+      queryCheckpoint('query_client_creation_start')
+      const generator = withRetry(
+        () =>
+          getInferenceClient({
+            maxRetries: 0, // Disabled auto-retry in favor of manual implementation
+            model: options.model,
+            fetchOverride: options.fetchOverride,
+            source: options.querySource,
+          }),
+        async (inferenceClient, _attempt, context) => {
+          attemptNumber++
+          isFastModeRequest = context.fastMode ?? false
+          start = Date.now()
+          attemptStartTimes.push(start)
+          // Client has been created by withRetry's getClient() call. This fires
+          // once per attempt; on retries the client is usually cached (withRetry
+          // only calls getClient() again after auth errors), so the delta from
+          // client_creation_start is meaningful on attempt 1.
+          queryCheckpoint('query_client_creation_end')
+
+          const params = paramsFromContext(context)
+          captureAPIRequest(params, options.querySource) // Capture for bug reports
+
+          maxOutputTokens = params.max_tokens
+
+          // Fire immediately before the fetch is dispatched. .withResponse() below
+          // awaits until response headers arrive, so this MUST be before the await
+          // or the "Network TTFB" phase measurement is wrong.
+          queryCheckpoint('query_api_request_sent')
+          if (!options.agentId) {
+            headlessProfilerCheckpoint('api_request_sent')
+          }
+
+          // Generate and track client request ID so timeouts (which return no
+          // server request ID) can still be correlated with server logs.
+          // First-party only — 3P providers don't log it (inc-4029 class).
+          clientRequestId =
+            getAPIProvider() === 'firstParty' && isFirstPartyNoumenaBaseUrl()
+              ? randomUUID()
+              : undefined
+
+          // Use raw stream instead of BetaMessageStream to avoid O(n²) partial JSON parsing
+          // BetaMessageStream calls partialParse() on every input_json_delta, which we don't need
+          // since we handle tool input accumulation ourselves
+          // biome-ignore lint/plugin: main conversation loop handles attribution separately
+          const result = await inferenceClient
+            .createMessage(
+              { ...params, stream: true },
+              {
+                signal,
+                ...(clientRequestId && {
+                  headers: { [CLIENT_REQUEST_ID_HEADER]: clientRequestId },
+                }),
+              },
+            )
+            .withResponse()
+          queryCheckpoint('query_response_headers_received')
+          streamRequestId = result.request_id
+          streamResponse = result.response
+          return result.data
+        },
+        {
           model: options.model,
-          fetchOverride: options.fetchOverride,
-          source: options.querySource,
-        }),
-      async (inferenceClient, attempt, context) => {
-        attemptNumber = attempt
-        isFastModeRequest = context.fastMode ?? false
-        start = Date.now()
-        attemptStartTimes.push(start)
-        // Client has been created by withRetry's getClient() call. This fires
-        // once per attempt; on retries the client is usually cached (withRetry
-        // only calls getClient() again after auth errors), so the delta from
-        // client_creation_start is meaningful on attempt 1.
-        queryCheckpoint('query_client_creation_end')
+          fallbackModel: options.fallbackModel,
+          thinkingConfig,
+          ...(isFastModeEnabled() ? { fastMode: isFastMode } : false),
+          signal,
+          querySource: options.querySource,
+        },
+      )
 
-        const params = paramsFromContext(context)
-        captureAPIRequest(params, options.querySource) // Capture for bug reports
-
-        maxOutputTokens = params.max_tokens
-
-        // Fire immediately before the fetch is dispatched. .withResponse() below
-        // awaits until response headers arrive, so this MUST be before the await
-        // or the "Network TTFB" phase measurement is wrong.
-        queryCheckpoint('query_api_request_sent')
-        if (!options.agentId) {
-          headlessProfilerCheckpoint('api_request_sent')
-        }
-
-        // Generate and track client request ID so timeouts (which return no
-        // server request ID) can still be correlated with server logs.
-        // First-party only — 3P providers don't log it (inc-4029 class).
-        clientRequestId =
-          getAPIProvider() === 'firstParty' && isFirstPartyNoumenaBaseUrl()
-            ? randomUUID()
-            : undefined
-
-        // Use raw stream instead of BetaMessageStream to avoid O(n²) partial JSON parsing
-        // BetaMessageStream calls partialParse() on every input_json_delta, which we don't need
-        // since we handle tool input accumulation ourselves
-        // biome-ignore lint/plugin: main conversation loop handles attribution separately
-        const result = await inferenceClient
-          .createMessage(
-            { ...params, stream: true },
-            {
-              signal,
-              ...(clientRequestId && {
-                headers: { [CLIENT_REQUEST_ID_HEADER]: clientRequestId },
-              }),
-            },
-          )
-          .withResponse()
-        queryCheckpoint('query_response_headers_received')
-        streamRequestId = result.request_id
-        streamResponse = result.response
-        return result.data
-      },
-      {
-        model: options.model,
-        fallbackModel: options.fallbackModel,
-        thinkingConfig,
-        ...(isFastModeEnabled() ? { fastMode: isFastMode } : false),
-        signal,
-        querySource: options.querySource,
-      },
-    )
-
-    let e
-    do {
-      e = await generator.next()
-
-      // yield API error messages (the stream has a 'controller' property, error messages don't)
-      if (!('controller' in e.value)) {
-        yield e.value
+      let result = await generator.next()
+      while (!result.done) {
+        yield result.value
+        result = await generator.next()
       }
-    } while (!e.done)
-    stream = e.value as Stream<BetaRawMessageStreamEvent>
+      stream = result.value as Stream<BetaRawMessageStreamEvent>
+      return stream
+    }
 
-    // reset state
-    newMessages.length = 0
-    ttftMs = 0
-    partialMessage = undefined
-    contentBlocks.length = 0
-    usage = EMPTY_USAGE
-    stopReason = null
-    isAdvisorInProgress = false
+    function resetStreamingAttemptState(): void {
+      newMessages.length = 0
+      ttftMs = 0
+      partialMessage = undefined
+      contentBlocks.length = 0
+      usage = EMPTY_USAGE
+      stopReason = null
+      isAdvisorInProgress = false
+    }
 
     // Streaming idle timeout watchdog: abort the stream if no chunks arrive
     // for STREAM_IDLE_TIMEOUT_MS. Unlike the stall detection below (which only
@@ -1953,8 +2019,6 @@ async function* queryModel(
         releaseStreamResources()
       }, STREAM_IDLE_TIMEOUT_MS)
     }
-    resetStreamIdleTimer()
-
     startSessionActivity('api_call')
     try {
       // stream in and accumulate state
@@ -1964,7 +2028,51 @@ async function* queryModel(
       let totalStallTime = 0
       let stallCount = 0
 
-      for await (const part of stream) {
+      const retriedStream = withOpenAIResponsesStreamRetry(
+        createStreamingAttempt,
+        {
+          signal,
+          // The Responses adapter withholds content_block_stop until a valid
+          // terminal event, so no assistant message or tool execution should
+          // be committed before a retry. Fail closed if that invariant changes.
+          canRetry: () => newMessages.length === 0,
+          onRetry: (_error, attempt, delayMs) => {
+            clearStreamIdleTimers()
+            releaseStreamResources()
+            logForDebugging(
+              `Responses stream failed; retrying attempt ${attempt} after ${Math.round(delayMs)}ms`,
+              { level: 'warn' },
+            )
+          },
+        },
+      )
+
+      for await (const retryEvent of retriedStream) {
+        if (retryEvent.type === 'system') {
+          yield retryEvent.message
+          continue
+        }
+        if (retryEvent.type === 'attempt_start') {
+          if (retryEvent.attempt > 1) {
+            // Clear provisional text/thinking/tool previews from the failed
+            // attempt before the replacement stream starts.
+            yield {
+              type: 'stream_event',
+              event: { type: 'message_stop' },
+            }
+          }
+          resetStreamingAttemptState()
+          isFirstChunk = true
+          lastEventTime = null
+          totalStallTime = 0
+          stallCount = 0
+          streamIdleAborted = false
+          streamWatchdogFiredAt = null
+          resetStreamIdleTimer()
+          continue
+        }
+
+        const part = retryEvent.event
         resetStreamIdleTimer()
         const now = Date.now()
 
@@ -2268,11 +2376,62 @@ async function* queryModel(
             // captures the final values.
             stopReason = part.delta.stop_reason
 
-            const lastMsg = newMessages.at(-1)
+            const responseState = partialMessage
+              ? (
+                  partialMessage as unknown as Record<string, unknown>
+                )._openai_response_state
+              : undefined
+            const responseItems =
+              responseState &&
+              typeof responseState === 'object' &&
+              'items' in responseState &&
+              Array.isArray(responseState.items)
+                ? responseState.items
+                : undefined
+            let lastMsg = newMessages.at(-1)
+            let metadataOnlyMessage: AssistantMessage | undefined
+            // Responses can complete with only opaque reasoning state. Persist
+            // an empty assistant envelope so the next turn can replay it.
+            if (
+              !lastMsg &&
+              Array.isArray(responseItems) &&
+              responseItems.length > 0 &&
+              partialMessage
+            ) {
+              metadataOnlyMessage = {
+                message: {
+                  ...partialMessage,
+                  content: [],
+                  usage,
+                  stop_reason: stopReason,
+                },
+                requestId: streamRequestId ?? undefined,
+                type: 'assistant',
+                uuid: randomUUID(),
+                timestamp: new Date().toISOString(),
+                ...(isInternalBuild() &&
+                  research !== undefined && { research }),
+                ...(advisorModel && { advisorModel }),
+              }
+              lastMsg = metadataOnlyMessage
+              newMessages.push(lastMsg)
+            }
             if (lastMsg) {
               lastMsg.message.usage = usage
               lastMsg.message.stop_reason = stopReason
+
+              if (responseState && typeof responseState === 'object') {
+                for (const message of newMessages) {
+                  delete (
+                    message.message as unknown as Record<string, unknown>
+                  )._openai_response_state
+                }
+                ;(
+                  lastMsg.message as unknown as Record<string, unknown>
+                )._openai_response_state = responseState
+              }
             }
+            if (metadataOnlyMessage) yield metadataOnlyMessage
 
             // Update cost
             const costUSDForPart = calculateUSDCost(resolvedModel, usage)
@@ -2486,6 +2645,13 @@ async function* queryModel(
           // Throw a more specific error for timeout
           throw new APIConnectionTimeoutError({ message: 'Request timed out' })
         }
+      }
+
+      // A terminal Responses event is a completed server decision, not a
+      // broken stream. Retry transient failures through withRetry and surface
+      // permanent failures without changing transport modes.
+      if (isOpenAIResponsesResponseError(streamingError)) {
+        throw streamingError
       }
 
       // When the flag is enabled, skip the non-streaming fallback and let the

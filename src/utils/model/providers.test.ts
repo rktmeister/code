@@ -5,8 +5,11 @@ import {
   getNoumenaBaseUrl,
   getOpenAICompatBaseUrl,
   getOpenAICompatDefaultModel,
+  getOpenAIApiFormat,
   isOpenAICompatByokActive,
+  isOpenAIResponsesActive,
   isFirstPartyNoumenaBaseUrl,
+  modelSupportsOpenAIResponsesToolSearch,
 } from './providers.js'
 
 function resetEnv() {
@@ -15,6 +18,7 @@ function resetEnv() {
   delete process.env.OPENAI_API_KEY
   delete process.env.OPENAI_BASE_URL
   delete process.env.OPENAI_MODEL
+  delete process.env.OPENAI_API_FORMAT
   delete process.env.USER_TYPE
 }
 
@@ -89,6 +93,30 @@ describe('providers', () => {
 
     expect(getOpenAICompatBaseUrl()).toBe('https://openrouter.ai/api/v1')
     expect(getOpenAICompatDefaultModel()).toBe('openrouter/custom-model')
+  })
+
+  it('requires an explicit valid Responses format opt-in', () => {
+    expect(getOpenAIApiFormat()).toBe('chat_completions')
+    expect(isOpenAIResponsesActive()).toBe(false)
+
+    process.env.OPENAI_API_KEY = 'openai-key'
+    process.env.OPENAI_API_FORMAT = 'responses'
+    expect(getOpenAIApiFormat()).toBe('responses')
+    expect(isOpenAIResponsesActive()).toBe(true)
+
+    process.env.OPENAI_API_FORMAT = 'invalid'
+    expect(() => getOpenAIApiFormat()).toThrow('Invalid OPENAI_API_FORMAT')
+  })
+
+  it('recognizes models supported by OpenAI Responses tool search', () => {
+    expect(modelSupportsOpenAIResponsesToolSearch('gpt-5.4')).toBe(true)
+    expect(modelSupportsOpenAIResponsesToolSearch('openai/gpt-5.5-pro')).toBe(
+      true,
+    )
+    expect(modelSupportsOpenAIResponsesToolSearch('gpt-6')).toBe(true)
+    expect(modelSupportsOpenAIResponsesToolSearch('gpt-5.3')).toBe(false)
+    expect(modelSupportsOpenAIResponsesToolSearch('o3')).toBe(false)
+    expect(modelSupportsOpenAIResponsesToolSearch('local-model')).toBe(false)
   })
 
 })
