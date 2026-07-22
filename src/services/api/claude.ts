@@ -260,6 +260,7 @@ import {
   is529Error,
   type RetryContext,
   withRetry,
+  withOpenAIResponsesStreamRetry,
 } from './withRetry.js'
 
 // Define a type that represents valid JSON values
@@ -1863,96 +1864,99 @@ async function* queryModel(
   let isAdvisorInProgress = false
 
   try {
-    queryCheckpoint('query_client_creation_start')
-    const generator = withRetry(
-      () =>
-        getInferenceClient({
-          maxRetries: 0, // Disabled auto-retry in favor of manual implementation
+    async function* createStreamingAttempt(): AsyncGenerator<
+      SystemAPIErrorMessage,
+      Stream<BetaRawMessageStreamEvent>
+    > {
+      queryCheckpoint('query_client_creation_start')
+      const generator = withRetry(
+        () =>
+          getInferenceClient({
+            maxRetries: 0, // Disabled auto-retry in favor of manual implementation
+            model: options.model,
+            fetchOverride: options.fetchOverride,
+            source: options.querySource,
+          }),
+        async (inferenceClient, _attempt, context) => {
+          attemptNumber++
+          isFastModeRequest = context.fastMode ?? false
+          start = Date.now()
+          attemptStartTimes.push(start)
+          // Client has been created by withRetry's getClient() call. This fires
+          // once per attempt; on retries the client is usually cached (withRetry
+          // only calls getClient() again after auth errors), so the delta from
+          // client_creation_start is meaningful on attempt 1.
+          queryCheckpoint('query_client_creation_end')
+
+          const params = paramsFromContext(context)
+          captureAPIRequest(params, options.querySource) // Capture for bug reports
+
+          maxOutputTokens = params.max_tokens
+
+          // Fire immediately before the fetch is dispatched. .withResponse() below
+          // awaits until response headers arrive, so this MUST be before the await
+          // or the "Network TTFB" phase measurement is wrong.
+          queryCheckpoint('query_api_request_sent')
+          if (!options.agentId) {
+            headlessProfilerCheckpoint('api_request_sent')
+          }
+
+          // Generate and track client request ID so timeouts (which return no
+          // server request ID) can still be correlated with server logs.
+          // First-party only — 3P providers don't log it (inc-4029 class).
+          clientRequestId =
+            getAPIProvider() === 'firstParty' && isFirstPartyNoumenaBaseUrl()
+              ? randomUUID()
+              : undefined
+
+          // Use raw stream instead of BetaMessageStream to avoid O(n²) partial JSON parsing
+          // BetaMessageStream calls partialParse() on every input_json_delta, which we don't need
+          // since we handle tool input accumulation ourselves
+          // biome-ignore lint/plugin: main conversation loop handles attribution separately
+          const result = await inferenceClient
+            .createMessage(
+              { ...params, stream: true },
+              {
+                signal,
+                ...(clientRequestId && {
+                  headers: { [CLIENT_REQUEST_ID_HEADER]: clientRequestId },
+                }),
+              },
+            )
+            .withResponse()
+          queryCheckpoint('query_response_headers_received')
+          streamRequestId = result.request_id
+          streamResponse = result.response
+          return result.data
+        },
+        {
           model: options.model,
-          fetchOverride: options.fetchOverride,
-          source: options.querySource,
-        }),
-      async (inferenceClient, attempt, context) => {
-        attemptNumber = attempt
-        isFastModeRequest = context.fastMode ?? false
-        start = Date.now()
-        attemptStartTimes.push(start)
-        // Client has been created by withRetry's getClient() call. This fires
-        // once per attempt; on retries the client is usually cached (withRetry
-        // only calls getClient() again after auth errors), so the delta from
-        // client_creation_start is meaningful on attempt 1.
-        queryCheckpoint('query_client_creation_end')
+          fallbackModel: options.fallbackModel,
+          thinkingConfig,
+          ...(isFastModeEnabled() ? { fastMode: isFastMode } : false),
+          signal,
+          querySource: options.querySource,
+        },
+      )
 
-        const params = paramsFromContext(context)
-        captureAPIRequest(params, options.querySource) // Capture for bug reports
-
-        maxOutputTokens = params.max_tokens
-
-        // Fire immediately before the fetch is dispatched. .withResponse() below
-        // awaits until response headers arrive, so this MUST be before the await
-        // or the "Network TTFB" phase measurement is wrong.
-        queryCheckpoint('query_api_request_sent')
-        if (!options.agentId) {
-          headlessProfilerCheckpoint('api_request_sent')
-        }
-
-        // Generate and track client request ID so timeouts (which return no
-        // server request ID) can still be correlated with server logs.
-        // First-party only — 3P providers don't log it (inc-4029 class).
-        clientRequestId =
-          getAPIProvider() === 'firstParty' && isFirstPartyNoumenaBaseUrl()
-            ? randomUUID()
-            : undefined
-
-        // Use raw stream instead of BetaMessageStream to avoid O(n²) partial JSON parsing
-        // BetaMessageStream calls partialParse() on every input_json_delta, which we don't need
-        // since we handle tool input accumulation ourselves
-        // biome-ignore lint/plugin: main conversation loop handles attribution separately
-        const result = await inferenceClient
-          .createMessage(
-            { ...params, stream: true },
-            {
-              signal,
-              ...(clientRequestId && {
-                headers: { [CLIENT_REQUEST_ID_HEADER]: clientRequestId },
-              }),
-            },
-          )
-          .withResponse()
-        queryCheckpoint('query_response_headers_received')
-        streamRequestId = result.request_id
-        streamResponse = result.response
-        return result.data
-      },
-      {
-        model: options.model,
-        fallbackModel: options.fallbackModel,
-        thinkingConfig,
-        ...(isFastModeEnabled() ? { fastMode: isFastMode } : false),
-        signal,
-        querySource: options.querySource,
-      },
-    )
-
-    let e
-    do {
-      e = await generator.next()
-
-      // yield API error messages (the stream has a 'controller' property, error messages don't)
-      if (!('controller' in e.value)) {
-        yield e.value
+      let result = await generator.next()
+      while (!result.done) {
+        yield result.value
+        result = await generator.next()
       }
-    } while (!e.done)
-    stream = e.value as Stream<BetaRawMessageStreamEvent>
+      stream = result.value as Stream<BetaRawMessageStreamEvent>
+      return stream
+    }
 
-    // reset state
-    newMessages.length = 0
-    ttftMs = 0
-    partialMessage = undefined
-    contentBlocks.length = 0
-    usage = EMPTY_USAGE
-    stopReason = null
-    isAdvisorInProgress = false
+    function resetStreamingAttemptState(): void {
+      newMessages.length = 0
+      ttftMs = 0
+      partialMessage = undefined
+      contentBlocks.length = 0
+      usage = EMPTY_USAGE
+      stopReason = null
+      isAdvisorInProgress = false
+    }
 
     // Streaming idle timeout watchdog: abort the stream if no chunks arrive
     // for STREAM_IDLE_TIMEOUT_MS. Unlike the stall detection below (which only
@@ -2015,8 +2019,6 @@ async function* queryModel(
         releaseStreamResources()
       }, STREAM_IDLE_TIMEOUT_MS)
     }
-    resetStreamIdleTimer()
-
     startSessionActivity('api_call')
     try {
       // stream in and accumulate state
@@ -2026,7 +2028,51 @@ async function* queryModel(
       let totalStallTime = 0
       let stallCount = 0
 
-      for await (const part of stream) {
+      const retriedStream = withOpenAIResponsesStreamRetry(
+        createStreamingAttempt,
+        {
+          signal,
+          // The Responses adapter withholds content_block_stop until a valid
+          // terminal event, so no assistant message or tool execution should
+          // be committed before a retry. Fail closed if that invariant changes.
+          canRetry: () => newMessages.length === 0,
+          onRetry: (_error, attempt, delayMs) => {
+            clearStreamIdleTimers()
+            releaseStreamResources()
+            logForDebugging(
+              `Responses stream failed; retrying attempt ${attempt} after ${Math.round(delayMs)}ms`,
+              { level: 'warn' },
+            )
+          },
+        },
+      )
+
+      for await (const retryEvent of retriedStream) {
+        if (retryEvent.type === 'system') {
+          yield retryEvent.message
+          continue
+        }
+        if (retryEvent.type === 'attempt_start') {
+          if (retryEvent.attempt > 1) {
+            // Clear provisional text/thinking/tool previews from the failed
+            // attempt before the replacement stream starts.
+            yield {
+              type: 'stream_event',
+              event: { type: 'message_stop' },
+            }
+          }
+          resetStreamingAttemptState()
+          isFirstChunk = true
+          lastEventTime = null
+          totalStallTime = 0
+          stallCount = 0
+          streamIdleAborted = false
+          streamWatchdogFiredAt = null
+          resetStreamIdleTimer()
+          continue
+        }
+
+        const part = retryEvent.event
         resetStreamIdleTimer()
         const now = Date.now()
 

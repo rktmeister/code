@@ -1,5 +1,5 @@
 import type Anthropic from '@anthropic-ai/sdk'
-import { APIError } from '@anthropic-ai/sdk'
+import { APIError, APIUserAbortError } from '@anthropic-ai/sdk'
 import {
   afterAll,
   afterEach,
@@ -32,6 +32,7 @@ import {
   is529Error,
   parseMaxTokensContextOverflowError,
   withRetry,
+  withOpenAIResponsesStreamRetry,
 } from './withRetry.js'
 import {
   OpenAICompatBackendAbortError,
@@ -39,6 +40,7 @@ import {
   OpenAICompatTransportError,
   OpenAIResponsesResponseError,
 } from './openAICompatInferenceClient.js'
+import { OpenAIResponsesInferenceClient } from './openAIResponsesInferenceClient.js'
 
 let tempConfigDir = ''
 const originalMacro = (globalThis as { MACRO?: unknown }).MACRO
@@ -106,6 +108,10 @@ function makeApiError(
   headers?: Headers,
 ): APIError {
   return new APIError(status, { message }, undefined, headers)
+}
+
+async function* failingStream(error: unknown): AsyncGenerator<never> {
+  throw error
 }
 
 function makeOauthBackedRetrySession(): ResolvedAuthSession {
@@ -567,6 +573,247 @@ describe('withRetry', () => {
 
     expect(await iterator.next()).toEqual({ done: true, value: 'ok' })
     expect(attempts).toBe(2)
+  })
+
+  it('retries transient Responses errors raised while consuming a stream', async () => {
+    let attempts = 0
+    const factory = async function* (
+      attempt: number,
+    ): AsyncGenerator<never, AsyncIterable<string>> {
+      attempts++
+      return {
+        async *[Symbol.asyncIterator]() {
+          yield attempt === 1 ? 'partial' : 'complete'
+          if (attempt === 1) {
+            throw new OpenAIResponsesResponseError(
+              'server_error',
+              'server_error',
+              'Upstream inference failed',
+            )
+          }
+        },
+      }
+    }
+
+    const events = []
+    for await (const event of withOpenAIResponsesStreamRetry(factory, {
+      maxRetries: 1,
+      canRetry: () => true,
+    })) {
+      events.push(event)
+    }
+
+    expect(attempts).toBe(2)
+    expect(events).toEqual([
+      { type: 'attempt_start', attempt: 1 },
+      { type: 'event', attempt: 1, event: 'partial' },
+      { type: 'attempt_start', attempt: 2 },
+      { type: 'event', attempt: 2, event: 'complete' },
+    ])
+  })
+
+  it('retries an actual failed Responses SSE stream without releasing its output', async () => {
+    const failed = {
+      type: 'response.failed',
+      response: {
+        id: 'resp-failed',
+        model: 'gpt-test',
+        status: 'failed',
+        error: {
+          code: 'server_error',
+          type: 'server_error',
+          message: 'Upstream inference failed',
+        },
+        output: [],
+      },
+    }
+    const completed = [
+      {
+        type: 'response.created',
+        response: { id: 'resp-ok', model: 'gpt-test' },
+      },
+      { type: 'response.output_text.delta', delta: 'done' },
+      {
+        type: 'response.completed',
+        response: {
+          id: 'resp-ok',
+          model: 'gpt-test',
+          status: 'completed',
+          output: [],
+          usage: { input_tokens: 5, output_tokens: 1 },
+        },
+      },
+    ]
+      .map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`)
+      .join('')
+    const responses = [
+      `event: response.failed\ndata: ${JSON.stringify(failed)}\n\n`,
+      completed,
+    ]
+    let requests = 0
+    const client = new OpenAIResponsesInferenceClient({
+      baseURL: 'https://proxy.example.test/v1',
+      fetch: async () => new Response(responses[requests++]!),
+    })
+    const factory = async function* (): AsyncGenerator<
+      never,
+      AsyncIterable<unknown>
+    > {
+      return await client.createMessage({
+        model: 'gpt-test',
+        max_tokens: 10,
+        messages: [{ role: 'user', content: 'request' }],
+        stream: true,
+      })
+    }
+
+    const streamEvents: Array<{ type?: string }> = []
+    for await (const event of withOpenAIResponsesStreamRetry(factory, {
+      maxRetries: 1,
+      canRetry: () => true,
+    })) {
+      if (event.type === 'event') {
+        streamEvents.push(event.event as { type?: string })
+      }
+    }
+
+    expect(requests).toBe(2)
+    expect(streamEvents.filter(event => event.type === 'message_start')).toHaveLength(
+      2,
+    )
+    expect(
+      streamEvents.filter(event => event.type === 'content_block_stop'),
+    ).toHaveLength(1)
+    expect(streamEvents.filter(event => event.type === 'message_stop')).toHaveLength(
+      1,
+    )
+  })
+
+  it('does not retry a Responses stream after output is committed', async () => {
+    let attempts = 0
+    const responseError = new OpenAIResponsesResponseError(
+      'server_error',
+      'server_error',
+      'Upstream inference failed',
+    )
+    const factory = async function* (): AsyncGenerator<
+      never,
+      AsyncIterable<never>
+    > {
+      attempts++
+      return failingStream(responseError)
+    }
+
+    let caught: unknown
+    try {
+      for await (const _event of withOpenAIResponsesStreamRetry(factory, {
+        maxRetries: 1,
+        canRetry: () => false,
+      })) {
+        // Consume through the stream error.
+      }
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(OpenAIResponsesResponseError)
+    expect(attempts).toBe(1)
+  })
+
+  it('does not retry permanent Responses stream errors', async () => {
+    let attempts = 0
+    const responseError = new OpenAIResponsesResponseError(
+      'invalid_prompt',
+      'invalid_request_error',
+      'Prompt is invalid',
+    )
+    const factory = async function* (): AsyncGenerator<
+      never,
+      AsyncIterable<never>
+    > {
+      attempts++
+      return failingStream(responseError)
+    }
+
+    let caught: unknown
+    try {
+      for await (const _event of withOpenAIResponsesStreamRetry(factory, {
+        maxRetries: 2,
+        canRetry: () => true,
+      })) {
+        // Consume through the stream error.
+      }
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(OpenAIResponsesResponseError)
+    expect(attempts).toBe(1)
+  })
+
+  it('stops retrying a Responses stream after the configured budget', async () => {
+    let attempts = 0
+    const responseError = new OpenAIResponsesResponseError(
+      'server_error',
+      'server_error',
+      'Upstream inference failed',
+    )
+    const factory = async function* (): AsyncGenerator<
+      never,
+      AsyncIterable<never>
+    > {
+      attempts++
+      return failingStream(responseError)
+    }
+
+    let caught: unknown
+    try {
+      for await (const _event of withOpenAIResponsesStreamRetry(factory, {
+        maxRetries: 1,
+        canRetry: () => true,
+      })) {
+        // Consume until the retry budget is exhausted.
+      }
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBe(responseError)
+    expect(attempts).toBe(2)
+  })
+
+  it('stops Responses stream retries when aborted during backoff', async () => {
+    const controller = new AbortController()
+    let attempts = 0
+    const responseError = new OpenAIResponsesResponseError(
+      'server_error',
+      'server_error',
+      'Upstream inference failed',
+    )
+    const factory = async function* (): AsyncGenerator<
+      never,
+      AsyncIterable<never>
+    > {
+      attempts++
+      return failingStream(responseError)
+    }
+
+    let caught: unknown
+    try {
+      for await (const _event of withOpenAIResponsesStreamRetry(factory, {
+        maxRetries: 2,
+        signal: controller.signal,
+        canRetry: () => true,
+        onRetry: () => controller.abort(),
+      })) {
+        // Consume through the stream error.
+      }
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(APIUserAbortError)
+    expect(attempts).toBe(1)
   })
 
   it('keeps provider error details out of retry analytics', async () => {
